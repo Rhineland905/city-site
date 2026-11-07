@@ -42,28 +42,29 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 ];
 
-const MAP_TASK = `Город под землёй, поэтому обычная карта сверху (и BlueMap сервера) его не показывает. Нужна карта среза на высоте города. Способы от лучшего к простому:
+const MAP_TASK_TITLE = 'Завантажити мапу міста';
+const MAP_TASK = `Місто під землею, тому звичайна мапа згори (і BlueMap сервера) його не показує. Потрібна мапа зрізу на висоті міста. Способи від найкращого до найпростішого:
 
-СПОСОБ 1. Карта из схематика (лучший)
-1. В Litematica выдели весь город: Area Selection, два угла по краям города, захвати все этажи по высоте.
-2. Сохрани схематик (Save Schematic), файл появится в .minecraft/schematics.
-3. Запиши Corner 1 и Corner 2 из Area Editor.
-4. На сайте нажми «Войти», потом на вкладке «Карта» нажми «Карта из схематика».
-5. Выбери файл и впиши меньшие X, Y и Z из двух углов.
-6. Задай срез: «сверху» = чуть ниже потолка этажа, «снизу» = пол этажа. Превью покажет, что получится.
-7. Сохрани слой. Для каждого этажа можно сделать отдельный слой («Этаж 1», «Этаж 2»).
+СПОСІБ 1. Мапа зі схематика (найкращий)
+1. У Litematica виділи все місто: Area Selection, два кути по краях міста, захопи всі поверхи за висотою.
+2. Збережи схематик (Save Schematic), файл з’явиться в .minecraft/schematics.
+3. Запиши Corner 1 і Corner 2 з Area Editor.
+4. На сайті натисни «Увійти», потім на вкладці «Мапа» натисни «Мапа зі схематика».
+5. Вибери файл і впиши менші X, Y і Z з двох кутів.
+6. Задай зріз: «згори» = трохи нижче за стелю поверху, «знизу» = підлога поверху. Прев’ю покаже, що вийде.
+7. Збережи шар. Для кожного поверху можна зробити окремий шар («Поверх 1», «Поверх 2»).
 
-СПОСОБ 2. Xaero's World Map (без схематика)
-1. Поставь клиентский мод Xaero's World Map.
-2. Открой карту (M), нажми иконку пещеры внизу слева. Cave Mode Type = Full, а Cave Mode Top Y поставь чуть ниже потолка города.
-3. Пройди по всему городу, чтобы он прорисовался.
-4. Выгрузи карту в PNG через экспорт в меню карты.
-5. На сайте нажми «Загрузить картинку», впиши X и Z левого верхнего угла картинки и масштаб.
+СПОСІБ 2. Xaero's World Map (без схематика)
+1. Постав клієнтський мод Xaero's World Map.
+2. Відкрий мапу (M), натисни іконку печери внизу ліворуч. Cave Mode Type = Full, а Cave Mode Top Y постав трохи нижче за стелю міста.
+3. Пройди все місто, щоб воно промалювалося.
+4. Вивантаж мапу в PNG через експорт у меню мапи.
+5. На сайті натисни «Завантажити картинку», впиши X і Z лівого верхнього кута картинки та масштаб.
 
-СПОСОБ 3. Через админа сервера
-Попросить добавить в BlueMap отдельную карту с render-mask по высоте города (min-y / max-y) и выключенным remove-caves-below-y. Тогда подземный город появится на BlueMap и будет обновляться сам.
+СПОСІБ 3. Через адміна сервера
+Попросити додати в BlueMap окрему мапу з render-mask за висотою міста (min-y / max-y) і вимкненим remove-caves-below-y. Тоді підземне місто з’явиться на BlueMap і оновлюватиметься саме.
 
-Файл картинки должен быть не больше 25 МБ.`;
+Файл картинки має бути не більшим за 25 МБ.`;
 
 let schemaReady = null;
 function ensureSchema(env) {
@@ -75,7 +76,22 @@ function ensureSchema(env) {
     ).run();
     if (claim.meta.changes === 1) {
       await env.DB.prepare('INSERT INTO tasks (title, description) VALUES (?, ?)')
-        .bind('Загрузить карту города', MAP_TASK).run();
+        .bind(MAP_TASK_TITLE, MAP_TASK).run();
+    }
+    // Сайт перейшов на українську: один раз перекладаємо перше завдання (якщо його ще ніхто не правив)
+    // і шари, названі стандартними російськими назвами з підказок.
+    const uk = await env.DB.prepare(
+      "INSERT INTO settings (key, value) VALUES ('seeded_uk', '1') ON CONFLICT(key) DO NOTHING"
+    ).run();
+    if (uk.meta.changes === 1) {
+      await env.DB.prepare(
+        "UPDATE tasks SET title = ?, description = ? WHERE title = 'Загрузить карту города' AND description LIKE 'Город под землёй%'"
+      ).bind(MAP_TASK_TITLE, MAP_TASK).run();
+      const names = { 'Подземный город': 'Підземне місто', 'Поверхность': 'Поверхня', 'Этаж 1': 'Поверх 1', 'Этаж 2': 'Поверх 2' };
+      const layers = await getLayers(env);
+      if (layers.some((l) => names[l.name])) {
+        await saveLayers(env, layers.map((l) => ({ ...l, name: names[l.name] || l.name })));
+      }
     }
   })().catch((e) => { schemaReady = null; throw e; });
   return schemaReady;
@@ -87,21 +103,21 @@ export async function onRequest({ request, env, params }) {
   const [section, id, action] = parts;
 
   if (!env.DB || !env.FILES) {
-    return fail(500, 'Сайт не настроен: в Cloudflare не привязаны база DB и хранилище FILES');
+    return fail(500, 'Сайт не налаштовано: у Cloudflare не прив’язані база DB і сховище FILES');
   }
 
   try {
     await ensureSchema(env);
     if (section === 'auth' && method === 'POST') {
-      return authorized(request, env) ? json({ ok: true }) : fail(401, 'Неверный пароль');
+      return authorized(request, env) ? json({ ok: true }) : fail(401, 'Неправильний пароль');
     }
     if (section === 'schematics') return await schematics(request, env, method, id, action);
     if (section === 'tasks') return await tasks(request, env, method, id);
     if (section === 'map') return await map(request, env, method, id, action);
-    return fail(404, 'Не найдено');
+    return fail(404, 'Не знайдено');
   } catch (e) {
     console.error(e);
-    return fail(500, 'Ошибка сервера');
+    return fail(500, 'Помилка сервера');
   }
 }
 
@@ -114,18 +130,18 @@ async function schematics(request, env, method, id, action) {
   }
 
   if (!id && method === 'POST') {
-    if (!authorized(request, env)) return fail(401, 'Нужен пароль редактора');
+    if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
     const form = await request.formData();
     const file = form.get('file');
-    if (!file || typeof file === 'string') return fail(400, 'Не выбран файл');
-    if (file.size > MAX_FILE) return fail(400, 'Файл больше 25 МБ');
+    if (!file || typeof file === 'string') return fail(400, 'Не вибрано файл');
+    if (file.size > MAX_FILE) return fail(400, 'Файл більший за 25 МБ');
     const ext = (file.name.split('.').pop() || '').toLowerCase();
-    if (!SCHEM_EXT.includes(ext)) return fail(400, 'Поддерживаются .schem, .litematic, .schematic, .nbt');
+    if (!SCHEM_EXT.includes(ext)) return fail(400, 'Підтримуються .schem, .litematic, .schematic, .nbt');
 
     const name = str(form.get('name'), 120);
     const x = int(form.get('x')), y = int(form.get('y')), z = int(form.get('z'));
-    if (!name) return fail(400, 'Укажи название');
-    if (x === null || y === null || z === null) return fail(400, 'Координаты должны быть целыми числами');
+    if (!name) return fail(400, 'Вкажи назву');
+    if (x === null || y === null || z === null) return fail(400, 'Координати мають бути цілими числами');
     const dimension = DIMENSIONS.includes(form.get('dimension')) ? form.get('dimension') : 'overworld';
 
     const newId = crypto.randomUUID();
@@ -141,13 +157,13 @@ async function schematics(request, env, method, id, action) {
     return json({ id: newId }, 201);
   }
 
-  if (!id) return fail(405, 'Метод не поддерживается');
+  if (!id) return fail(405, 'Метод не підтримується');
   const row = await env.DB.prepare('SELECT * FROM schematics WHERE id = ?').bind(id).first();
-  if (!row) return fail(404, 'Схематик не найден');
+  if (!row) return fail(404, 'Схематик не знайдено');
 
   if (method === 'GET' && action === 'file') {
     const data = await env.FILES.get(`schem:${id}`, 'arrayBuffer');
-    if (!data) return fail(404, 'Файл не найден');
+    if (!data) return fail(404, 'Файл не знайдено');
     const url = new URL(request.url);
     const inline = url.searchParams.has('preview');
     return new Response(data, {
@@ -163,12 +179,12 @@ async function schematics(request, env, method, id, action) {
   if (method === 'GET') return json(row);
 
   if (method === 'DELETE') {
-    if (!authorized(request, env)) return fail(401, 'Нужен пароль редактора');
+    if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
     await env.FILES.delete(`schem:${id}`);
     await env.DB.prepare('DELETE FROM schematics WHERE id = ?').bind(id).run();
     return json({ ok: true });
   }
-  return fail(405, 'Метод не поддерживается');
+  return fail(405, 'Метод не підтримується');
 }
 
 async function tasks(request, env, method, id) {
@@ -176,12 +192,12 @@ async function tasks(request, env, method, id) {
     const { results } = await env.DB.prepare('SELECT * FROM tasks ORDER BY id').all();
     return json(results);
   }
-  if (!authorized(request, env)) return fail(401, 'Нужен пароль редактора');
+  if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
 
   if (!id && method === 'POST') {
     const body = await request.json();
     const title = str(body.title, 200);
-    if (!title) return fail(400, 'Укажи название задачи');
+    if (!title) return fail(400, 'Вкажи назву завдання');
     const status = STATUSES.includes(body.status) ? body.status : 'todo';
     const res = await env.DB.prepare(
       'INSERT INTO tasks (title, description, status, assignee) VALUES (?, ?, ?, ?) RETURNING *'
@@ -190,12 +206,12 @@ async function tasks(request, env, method, id) {
   }
 
   const taskId = int(id);
-  if (taskId === null) return fail(400, 'Неверный id');
+  if (taskId === null) return fail(400, 'Неправильний id');
 
   if (method === 'PATCH') {
     const body = await request.json();
     const cur = await env.DB.prepare('SELECT * FROM tasks WHERE id = ?').bind(taskId).first();
-    if (!cur) return fail(404, 'Задача не найдена');
+    if (!cur) return fail(404, 'Завдання не знайдено');
     const next = {
       title: body.title !== undefined ? str(body.title, 200) || cur.title : cur.title,
       description: body.description !== undefined ? str(body.description, 5000) : cur.description,
@@ -213,7 +229,7 @@ async function tasks(request, env, method, id) {
     await env.DB.prepare('DELETE FROM tasks WHERE id = ?').bind(taskId).run();
     return json({ ok: true });
   }
-  return fail(405, 'Метод не поддерживается');
+  return fail(405, 'Метод не підтримується');
 }
 
 // Слои карты: например «Поверхность» и «Подземный город». Список хранится в settings.maps,
@@ -233,7 +249,7 @@ async function map(request, env, method, id, action) {
 
   if (method === 'GET' && action === 'model') {
     const data = await env.FILES.get(`model:${id}`, 'arrayBuffer');
-    if (!data) return fail(404, 'У этого слоя нет 3D-модели');
+    if (!data) return fail(404, 'У цього шару немає 3D-моделі');
     return new Response(data, {
       headers: { 'content-type': 'application/octet-stream', 'cache-control': 'public, max-age=31536000, immutable' },
     });
@@ -241,7 +257,7 @@ async function map(request, env, method, id, action) {
 
   if (method === 'GET' && action === 'image') {
     const { value, metadata } = await env.FILES.getWithMetadata(`map:${id}`, 'arrayBuffer');
-    if (!value) return fail(404, 'Картинка слоя не найдена');
+    if (!value) return fail(404, 'Картинку шару не знайдено');
     return new Response(value, {
       headers: {
         'content-type': metadata?.type || 'image/png',
@@ -250,33 +266,33 @@ async function map(request, env, method, id, action) {
     });
   }
 
-  if (!authorized(request, env)) return fail(401, 'Нужен пароль редактора');
+  if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
 
   if (method === 'POST' && !id) {
     const form = await request.formData();
     const layers = await getLayers(env);
     const replaceId = str(form.get('layerId'), 64);
     const existing = replaceId ? layers.find((l) => l.id === replaceId) : null;
-    if (replaceId && !existing) return fail(404, 'Слой не найден');
+    if (replaceId && !existing) return fail(404, 'Шар не знайдено');
 
     const name = str(form.get('name'), 60) || existing?.name;
-    if (!name) return fail(400, 'Укажи название слоя');
+    if (!name) return fail(400, 'Вкажи назву шару');
     const dimension = DIMENSIONS.includes(form.get('dimension')) ? form.get('dimension') : 'overworld';
     const originX = int(form.get('originX')), originZ = int(form.get('originZ'));
     const scale = Number(form.get('scale'));
-    if (originX === null || originZ === null) return fail(400, 'Укажи X и Z левого верхнего угла');
-    if (!(scale >= 0.1 && scale <= 64)) return fail(400, 'Масштаб от 0.1 до 64 блоков на пиксель');
+    if (originX === null || originZ === null) return fail(400, 'Вкажи X і Z лівого верхнього кута');
+    if (!(scale >= 0.1 && scale <= 64)) return fail(400, 'Масштаб від 0.1 до 64 блоків на піксель');
 
     const file = form.get('image');
     const hasFile = file && typeof file !== 'string' && file.size > 0;
-    if (!hasFile && !existing) return fail(400, 'Не выбрана картинка');
+    if (!hasFile && !existing) return fail(400, 'Не вибрано картинку');
     let { width, height } = existing || {};
     if (hasFile) {
-      if (file.size > MAX_FILE) return fail(400, 'Картинка больше 25 МБ, сохрани её в JPG или WebP');
-      if (!/^image\/(png|jpeg|webp)$/.test(file.type)) return fail(400, 'Нужен PNG, JPG или WebP');
+      if (file.size > MAX_FILE) return fail(400, 'Картинка більша за 25 МБ, збережи її в JPG або WebP');
+      if (!/^image\/(png|jpeg|webp)$/.test(file.type)) return fail(400, 'Потрібен PNG, JPG або WebP');
       width = int(form.get('width'));
       height = int(form.get('height'));
-      if (!width || !height) return fail(400, 'Не удалось прочитать размер картинки');
+      if (!width || !height) return fail(400, 'Не вдалося прочитати розмір картинки');
     }
 
     // 3D-модель: схематик, из которого нарисована картинка. Хранится рядом со слоем.
@@ -284,11 +300,11 @@ async function map(request, env, method, id, action) {
     const hasModel = model && typeof model !== 'string' && model.size > 0;
     let modelInfo = existing?.model || null;
     if (hasModel) {
-      if (model.size > MAX_FILE) return fail(400, 'Схематик для 3D больше 25 МБ');
+      if (model.size > MAX_FILE) return fail(400, 'Схематик для 3D більший за 25 МБ');
       const ext = (model.name.split('.').pop() || '').toLowerCase();
-      if (!['schem', 'litematic'].includes(ext)) return fail(400, 'Для 3D нужен .schem или .litematic');
+      if (!['schem', 'litematic'].includes(ext)) return fail(400, 'Для 3D потрібен .schem або .litematic');
       const minY = int(form.get('modelMinY'));
-      if (minY === null) return fail(400, 'Укажи нижнюю высоту схематика');
+      if (minY === null) return fail(400, 'Вкажи нижню висоту схематика');
       modelInfo = { fileName: str(model.name, 200), format: ext, minY, version: Date.now() };
     } else if (hasFile) {
       modelInfo = null; // новая картинка не из схематика: старая модель больше не совпадает
@@ -311,11 +327,11 @@ async function map(request, env, method, id, action) {
 
   if (method === 'DELETE' && id) {
     const layers = await getLayers(env);
-    if (!layers.some((l) => l.id === id)) return fail(404, 'Слой не найден');
+    if (!layers.some((l) => l.id === id)) return fail(404, 'Шар не знайдено');
     await env.FILES.delete(`map:${id}`);
     await env.FILES.delete(`model:${id}`);
     await saveLayers(env, layers.filter((l) => l.id !== id));
     return json({ ok: true });
   }
-  return fail(405, 'Метод не поддерживается');
+  return fail(405, 'Метод не підтримується');
 }

@@ -10,7 +10,7 @@ const store = {
   set(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} },
 };
 
-const DIM_NAMES = { overworld: 'Верхний мир', nether: 'Незер', end: 'Энд' };
+const DIM_NAMES = { overworld: 'Верхній світ', nether: 'Незер', end: 'Енд' };
 const state = {
   password: store.get('editPassword') || '',
   schematics: [], tasks: [], layers: [],
@@ -33,7 +33,7 @@ async function api(path, opts = {}) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     if (res.status === 401 && state.password) setEditor(false);
-    throw new Error(data.error || 'Ошибка ' + res.status);
+    throw new Error(data.error || 'Помилка ' + res.status);
   }
   return data;
 }
@@ -51,7 +51,7 @@ const isEditor = () => document.body.classList.contains('editor');
 // ---------- Вход ----------
 function setEditor(on) {
   document.body.classList.toggle('editor', on);
-  $('#loginBtn').textContent = on ? 'Выйти' : 'Войти';
+  $('#loginBtn').textContent = on ? 'Вийти' : 'Увійти';
   if (!on) { state.password = ''; store.set('editPassword', null); }
 }
 
@@ -70,7 +70,7 @@ $('#loginForm').addEventListener('submit', async (e) => {
     setEditor(true);
     form.closest('dialog').close();
     form.reset();
-    toast('Ты вошёл как редактор');
+    toast('Режим редактора увімкнено');
   } catch (err) {
     state.password = '';
     showError(form, err.message);
@@ -167,7 +167,7 @@ function renderLayerSelect() {
   sel.hidden = !list.length;
   const cur = currentLayer();
   sel.innerHTML = list.map((l) => `<option value="${esc(l.id)}">${esc(l.name)}</option>`).join('')
-    + '<option value="">Только сетка</option>';
+    + '<option value="">Лише сітка</option>';
   sel.value = cur ? cur.id : '';
 }
 
@@ -258,15 +258,15 @@ async function show3d() {
   const key = `${layer.id}:${layer.model.version}`;
   try {
     if (v3d.key !== key) {
-      v3dStatus('Загружаю 3D-модель города…');
+      v3dStatus('Завантажую 3D-модель міста…');
       const [{ createViewer }, buf] = await Promise.all([
         import('./voxel.js'),
         fetch(`/api/map/${encodeURIComponent(layer.id)}/model?v=${layer.model.version}`).then((r) => {
-          if (!r.ok) throw new Error('модель не найдена');
+          if (!r.ok) throw new Error('модель не знайдено');
           return r.arrayBuffer();
         }),
       ]);
-      v3dStatus('Строю город из блоков…');
+      v3dStatus('Будую місто з блоків…');
       await new Promise((r) => setTimeout(r, 30));
       const schem = await parseSchematic(buf, layer.model.fileName);
       v3d.viewer ??= createViewer($('#v3dCanvas'));
@@ -285,7 +285,7 @@ async function show3d() {
     v3dStatus('');
   } catch (err) {
     console.error(err);
-    v3dStatus('Не удалось открыть 3D: ' + err.message);
+    v3dStatus('Не вдалося відкрити 3D: ' + err.message);
   }
 }
 
@@ -296,13 +296,13 @@ function build3d(keepView) {
 function applyClip() {
   const clip = $('#v3dClip');
   const y = Number(clip.value);
-  $('#v3dClipVal').textContent = y >= Number(clip.max) ? 'весь город' : 'Y ' + y;
+  $('#v3dClipVal').textContent = y >= Number(clip.max) ? 'усе місто' : 'Y ' + y;
   if (v3d.viewer && v3d.layer?.model) v3d.viewer.setClip(y - v3d.layer.model.minY + 1);
 }
 $('#v3dClip').addEventListener('input', applyClip);
 $('#v3dRock').addEventListener('change', () => {
   if (!v3d.schem) return;
-  v3dStatus('Перестраиваю…');
+  v3dStatus('Перебудовую…');
   setTimeout(() => { build3d(true); v3dStatus(''); }, 30);
 });
 
@@ -341,7 +341,7 @@ async function showSavedLayer(layer) {
 }
 
 function fillLayerSelect(select, { allowNew = true } = {}) {
-  select.innerHTML = (allowNew ? '<option value="">Новый слой</option>' : '')
+  select.innerHTML = (allowNew ? '<option value="">Новий шар</option>' : '')
     + state.layers.map((l) => `<option value="${esc(l.id)}">${esc(l.name)} · ${DIM_NAMES[l.dimension]}</option>`).join('');
 }
 
@@ -386,19 +386,19 @@ $('#mapForm').addEventListener('submit', (e) => {
     const layer = await api('map', { method: 'POST', body: fd });
     form.closest('dialog').close();
     await showSavedLayer(layer);
-    toast(`Слой «${layer.name}» сохранён`);
+    toast(`Шар «${layer.name}» збережено`);
   });
 });
 $('#mapForm [data-delete]').addEventListener('click', async () => {
   const form = $('#mapForm');
   const layer = state.layers.find((l) => l.id === form.layerId.value);
-  if (!layer || !confirm(`Удалить слой «${layer.name}»?`)) return;
+  if (!layer || !confirm(`Видалити шар «${layer.name}»?`)) return;
   try {
     await api('map/' + encodeURIComponent(layer.id), { method: 'DELETE' });
     form.closest('dialog').close();
     await loadLayers();
     renderCityMap();
-    toast('Слой удалён');
+    toast('Шар видалено');
   } catch (err) { showError(form, err.message); }
 });
 
@@ -409,10 +409,10 @@ $('#fromSchemBtn').addEventListener('click', () => {
   f.reset();
   fromSchem.schem = null;
   $('fieldset', f).disabled = true;
-  $('[data-info]', f).textContent = 'Большой город может читаться несколько секунд.';
-  $('[data-preview]', f).innerHTML = '<span class="muted">Здесь появится карта</span>';
+  $('[data-info]', f).textContent = 'Велике місто може читатися кілька секунд.';
+  $('[data-preview]', f).innerHTML = '<span class="muted">Тут з’явиться мапа</span>';
   fillLayerSelect(f.layerId);
-  const underground = state.layers.find((l) => /подзем/i.test(l.name));
+  const underground = state.layers.find((l) => /підзем|подзем/i.test(l.name));
   if (underground) { f.layerId.value = underground.id; f.name.value = underground.name; }
   f.dimension.value = state.dim;
   openDialog('#fromSchemDialog');
@@ -432,7 +432,7 @@ $('#fromSchemForm').file.addEventListener('change', async (e) => {
     const schem = await parseSchematic(await file.arrayBuffer(), file.name);
     fromSchem.schem = schem;
     fromSchem.file = file;
-    info.textContent = `${schem.width}×${schem.height}×${schem.length} блоков (ширина × высота × длина).`;
+    info.textContent = `${schem.width}×${schem.height}×${schem.length} блоків (ширина × висота × довжина).`;
     const minY = Number(f.minY.value) || 0;
     f.topY.value = minY + schem.height - 1;
     f.bottomY.value = minY;
@@ -441,7 +441,7 @@ $('#fromSchemForm').file.addEventListener('change', async (e) => {
   } catch (err) {
     console.error(err);
     info.textContent = '';
-    showError(f, 'Не удалось прочитать схематик: ' + err.message);
+    showError(f, 'Не вдалося прочитати схематик: ' + err.message);
   }
 });
 
@@ -474,8 +474,8 @@ $('#fromSchemForm').addEventListener('submit', (e) => {
   e.preventDefault();
   const form = e.target;
   withBusy(form, async () => {
-    if (!fromSchem.schem) throw new Error('Сначала выбери схематик');
-    if (Number(form.topY.value) < Number(form.bottomY.value)) throw new Error('Верх среза должен быть выше низа');
+    if (!fromSchem.schem) throw new Error('Спершу вибери схематик');
+    if (Number(form.topY.value) < Number(form.bottomY.value)) throw new Error('Верх зрізу має бути вище за низ');
     const canvas = fromSchemCanvas();
     let blob = await new Promise((r) => canvas.toBlob(r, 'image/png'));
     let type = 'image/png';
@@ -486,7 +486,7 @@ $('#fromSchemForm').addEventListener('submit', (e) => {
     const fd = new FormData();
     fd.set('image', new File([blob], type === 'image/png' ? 'map.png' : 'map.webp', { type }));
     fd.set('layerId', form.layerId.value);
-    fd.set('name', form.name.value || 'Подземный город');
+    fd.set('name', form.name.value || 'Підземне місто');
     fd.set('dimension', form.dimension.value);
     fd.set('originX', form.minX.value);
     fd.set('originZ', form.minZ.value);
@@ -498,7 +498,7 @@ $('#fromSchemForm').addEventListener('submit', (e) => {
     const layer = await api('map', { method: 'POST', body: fd });
     form.closest('dialog').close();
     await showSavedLayer(layer);
-    toast(`Слой «${layer.name}» сохранён`);
+    toast(`Шар «${layer.name}» збережено`);
   });
 });
 
@@ -522,7 +522,7 @@ function renderSchemList() {
         ${s.author ? `<span>${esc(s.author)}</span>` : ''}
       </div>
     </article>`).join('')
-    : `<p class="empty">${q ? 'Ничего не нашлось' : 'Схематиков пока нет. Войди как редактор и загрузи первый.'}</p>`;
+    : `<p class="empty">${q ? 'Нічого не знайшлося' : 'Схематиків поки немає. Увійди як редактор і завантаж перший.'}</p>`;
 }
 $('#schemSearch').addEventListener('input', renderSchemList);
 $('#schemList').addEventListener('click', (e) => {
@@ -554,27 +554,27 @@ async function openSchematic(id) {
   const blue = bluemapLink(s.dimension, s.x, s.y, s.z, 60);
   $('#drawerBody').innerHTML = `
     <h2>${esc(s.name)}</h2>
-    <div class="meta muted">${s.author ? 'Автор: ' + esc(s.author) + ' · ' : ''}${new Date(s.created_at.replace(' ', 'T') + 'Z').toLocaleDateString('ru')}</div>
-    <div class="preview" id="previewBox"><div class="status">Загружаю превью…</div></div>
+    <div class="meta muted">${s.author ? 'Автор: ' + esc(s.author) + ' · ' : ''}${new Date(s.created_at.replace(' ', 'T') + 'Z').toLocaleDateString('uk')}</div>
+    <div class="preview" id="previewBox"><div class="status">Завантажую прев’ю…</div></div>
     <dl>
-      <dt>Координаты</dt><dd class="mono">X ${s.x} · Y ${s.y} · Z ${s.z}</dd>
-      <dt>Измерение</dt><dd>${DIM_NAMES[s.dimension] || esc(s.dimension)}</dd>
-      ${dims(s) ? `<dt>Размер</dt><dd class="mono">${dims(s)} блоков</dd>` : ''}
+      <dt>Координати</dt><dd class="mono">X ${s.x} · Y ${s.y} · Z ${s.z}</dd>
+      <dt>Вимір</dt><dd>${DIM_NAMES[s.dimension] || esc(s.dimension)}</dd>
+      ${dims(s) ? `<dt>Розмір</dt><dd class="mono">${dims(s)} блоків</dd>` : ''}
       <dt>Файл</dt><dd>${esc(s.file_name)} · ${fmtSize(s.file_size)}</dd>
     </dl>
     ${s.description ? `<p class="desc">${esc(s.description)}</p>` : ''}
     <div class="actions">
-      <a class="btn primary" href="/api/schematics/${esc(s.id)}/file" download>Скачать</a>
-      <button class="btn" data-act="tp">Скопировать /tp</button>
-      <button class="btn" data-act="show">На карте</button>
+      <a class="btn primary" href="/api/schematics/${esc(s.id)}/file" download>Скачати</a>
+      <button class="btn" data-act="tp">Скопіювати /tp</button>
+      <button class="btn" data-act="show">На мапі</button>
       ${blue ? `<a class="btn" href="${esc(blue)}" target="_blank" rel="noopener">BlueMap</a>` : ''}
-      <button class="btn danger editor-only" data-act="delete">Удалить</button>
+      <button class="btn danger editor-only" data-act="delete">Видалити</button>
     </div>`;
   $('#schemDrawer').hidden = false;
 
   const body = $('#drawerBody');
   $('[data-act=tp]', body).onclick = async () => {
-    try { await navigator.clipboard.writeText(tp); toast('Скопировано: ' + tp); }
+    try { await navigator.clipboard.writeText(tp); toast('Скопійовано: ' + tp); }
     catch { toast(tp); }
   };
   $('[data-act=show]', body).onclick = () => {
@@ -583,18 +583,18 @@ async function openSchematic(id) {
     map.setView(toLatLng(s.x, s.z), 2);
   };
   $('[data-act=delete]', body).onclick = async () => {
-    if (!confirm(`Удалить «${s.name}»? Файл удалится навсегда.`)) return;
+    if (!confirm(`Видалити «${s.name}»? Файл зникне назавжди.`)) return;
     try {
       await api('schematics/' + s.id, { method: 'DELETE' });
       state.schematics = state.schematics.filter((x) => x.id !== s.id);
       closeDrawer(); renderSchemList(); renderMarkers();
-      toast('Схематик удалён');
+      toast('Схематик видалено');
     } catch (err) { toast(err.message); }
   };
 
   const box = $('#previewBox');
   if (!['schem', 'litematic'].includes(s.format)) {
-    $('.status', box).textContent = 'Превью есть только для .schem и .litematic, но файл можно скачать.';
+    $('.status', box).textContent = 'Прев’ю є лише для .schem і .litematic, але файл можна скачати.';
     return;
   }
   try {
@@ -610,7 +610,7 @@ async function openSchematic(id) {
     // У подземных построек вокруг сплошная порода: по умолчанию её прячем.
     const toggle = document.createElement('label');
     toggle.className = 'check';
-    toggle.innerHTML = '<input type="checkbox"> Скрыть породу и руды';
+    toggle.innerHTML = '<input type="checkbox"> Сховати породу й руди';
     const cb = $('input', toggle);
     cb.checked = naturalShare(parsed) > 0.4;
     box.after(toggle);
@@ -621,14 +621,14 @@ async function openSchematic(id) {
     draw();
   } catch (err) {
     console.error(err);
-    if (box.isConnected) box.innerHTML = '<div class="status">Не удалось построить превью, но файл можно скачать.</div>';
+    if (box.isConnected) box.innerHTML = '<div class="status">Не вдалося побудувати прев’ю, але файл можна скачати.</div>';
   }
 }
 
 function openSchemDialog(prefill = {}) {
   const f = $('#schemForm');
   f.reset();
-  $('#schemFileInfo').textContent = '.schem, .litematic, .schematic или .nbt, до 25 МБ';
+  $('#schemFileInfo').textContent = '.schem, .litematic, .schematic або .nbt, до 25 МБ';
   if (prefill.x !== undefined) { f.x.value = prefill.x; f.z.value = prefill.z; }
   f.dimension.value = state.dim;
   f.author.value = store.get('author') || '';
@@ -649,7 +649,7 @@ $('#schemForm').file.addEventListener('change', async (e) => {
   try {
     const p = await parseSchematic(await file.arrayBuffer(), file.name);
     f.dataset.dims = JSON.stringify([p.width, p.height, p.length]);
-    info.textContent = `${fmtSize(file.size)} · ${p.width}×${p.height}×${p.length} блоков`;
+    info.textContent = `${fmtSize(file.size)} · ${p.width}×${p.height}×${p.length} блоків`;
   } catch { /* размеры не обязательны */ }
 });
 
@@ -666,7 +666,7 @@ $('#schemForm').addEventListener('submit', (e) => {
     const { id } = await api('schematics', { method: 'POST', body: fd });
     form.closest('dialog').close();
     await loadSchematics();
-    toast('Схематик загружен');
+    toast('Схематик завантажено');
     openSchematic(id);
   });
 });
@@ -696,7 +696,7 @@ function openTask(task) {
   const f = $('#taskForm');
   const editor = isEditor();
   f.reset();
-  $('[data-title]', f).textContent = task ? (editor ? 'Задача' : task.title) : 'Новая задача';
+  $('[data-title]', f).textContent = task ? (editor ? 'Завдання' : task.title) : 'Нове завдання';
   f.dataset.id = task ? task.id : '';
   if (task) {
     f.title.value = task.title; f.description.value = task.description || '';
@@ -725,7 +725,7 @@ $('#taskForm').addEventListener('submit', (e) => {
 });
 $('#taskForm [data-delete]').addEventListener('click', async () => {
   const form = $('#taskForm');
-  if (!confirm('Удалить задачу?')) return;
+  if (!confirm('Видалити завдання?')) return;
   try {
     await api('tasks/' + form.dataset.id, { method: 'DELETE' });
     form.closest('dialog').close();
@@ -786,6 +786,6 @@ async function loadTasks() {
     const m = location.hash.match(/^#s=(.+)$/);
     if (m) openSchematic(m[1]);
   } catch (err) {
-    toast('Не удалось загрузить данные: ' + err.message);
+    toast('Не вдалося завантажити дані: ' + err.message);
   }
 })();

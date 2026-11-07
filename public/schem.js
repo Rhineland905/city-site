@@ -58,11 +58,11 @@ function readNbt(buffer) {
         for (let i = 0; i < n; i++) { v[i * 2 + 1] = view.getUint32(p); v[i * 2] = view.getUint32(p + 4); p += 8; }
         return v;
       }
-      default: throw new Error('Неизвестный тег NBT ' + type);
+      default: throw new Error('Невідомий тег NBT ' + type);
     }
   };
   const rootType = view.getInt8(p++);
-  if (rootType !== 10) throw new Error('Файл не похож на NBT');
+  if (rootType !== 10) throw new Error('Файл не схожий на NBT');
   str();
   return payload(10);
 }
@@ -71,8 +71,8 @@ const baseName = (state) => state.replace(/\[.*$/, '');
 
 function allocBlocks(width, height, length) {
   const total = width * height * length;
-  if (!total) throw new Error('Пустой схематик');
-  if (total > MAX_VOLUME) throw new Error('Схематик слишком большой для браузера, раздели его на части');
+  if (!total) throw new Error('Порожній схематик');
+  if (total > MAX_VOLUME) throw new Error('Схематик завеликий для браузера, розділи його на частини');
   return new Uint16Array(total);
 }
 
@@ -82,10 +82,10 @@ function parseSponge(root) {
   const container = s.Blocks || s; // v3 хранит блоки в Blocks
   const paletteObj = container.Palette;
   const data = container.Data || container.BlockData;
-  if (!paletteObj || !data) throw new Error('В схематике нет блоков');
+  if (!paletteObj || !data) throw new Error('У схематику немає блоків');
   const palette = [];
   for (const [state, idx] of Object.entries(paletteObj)) palette[idx] = baseName(state);
-  if (palette.length > 65535) throw new Error('Слишком много разных блоков');
+  if (palette.length > 65535) throw new Error('Забагато різних блоків');
   const blocks = allocBlocks(width, height, length);
   // Номера блоков записаны как varint.
   const total = blocks.length;
@@ -100,7 +100,7 @@ function parseSponge(root) {
 
 function parseLitematic(root) {
   const regions = Object.values(root.Regions || {});
-  if (!regions.length) throw new Error('В litematic нет регионов');
+  if (!regions.length) throw new Error('У litematic немає регіонів');
   // Общая рамка всех регионов (размер может быть отрицательным).
   const boxes = regions.map((r) => {
     const pos = r.Position, size = r.Size;
@@ -145,7 +145,7 @@ function parseLitematic(root) {
       blocks[(dx + x) + (dz + z) * width + (dy + y) * width * length] = id;
     }
   }
-  if (palette.length > 65535) throw new Error('Слишком много разных блоков');
+  if (palette.length > 65535) throw new Error('Забагато різних блоків');
   return { width, height, length, blocks, palette };
 }
 
@@ -154,7 +154,7 @@ export async function parseSchematic(buffer, fileName) {
   const root = readNbt(await gunzip(buffer));
   if (ext === 'litematic' || root.Regions) return parseLitematic(root);
   if (ext === 'schem' || root.Schematic || root.Palette) return parseSponge(root);
-  throw new Error('Поддерживаются только .schem и .litematic');
+  throw new Error('Підтримуються лише .schem і .litematic');
 }
 
 // Какая доля непустых блоков — природная порода (для подземных построек это обычно больше половины).
