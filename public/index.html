@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Город</title>
+  <meta name="description" content="Карта города, схематики построек и трекер задач">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' shape-rendering='crispEdges'><rect width='16' height='16' fill='%23071013'/><rect x='2' y='2' width='12' height='12' fill='%230b2a2f'/><rect x='5' y='5' width='6' height='6' fill='%2322e1e3'/></svg>">
+  <meta name="theme-color" content="#04080a">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500&family=Pixelify+Sans:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+    { "imports": {
+      "three": "./vendor/three/three.module.js"
+    } }
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name" id="brandName">Город</span></div>
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-view="map" role="tab">Карта</button>
+      <button class="tab" data-view="schematics" role="tab">Схематики</button>
+      <button class="tab" data-view="tasks" role="tab">Задачи</button>
+    </nav>
+    <button class="btn ghost" id="loginBtn">Войти</button>
+  </header>
+
+  <main>
+    <!-- Карта -->
+    <section class="view active" id="view-map">
+      <div id="map"></div>
+      <div id="view3d" hidden>
+        <div id="v3dCanvas"></div>
+        <div class="v3d-status" id="v3dStatus" hidden></div>
+        <div class="v3d-panel">
+          <label class="v3d-clip">Срез по высоте: <span class="mono" id="v3dClipVal"></span>
+            <input type="range" id="v3dClip" step="1"></label>
+          <label class="check"><input type="checkbox" id="v3dRock"> Скрыть породу и руды</label>
+          <p class="muted small-note">Крути мышью, правая кнопка двигает, колесо приближает. Клик по метке открывает схематик.</p>
+        </div>
+      </div>
+      <div class="map-toolbar">
+        <select id="dimSelect" aria-label="Измерение">
+          <option value="overworld">Верхний мир</option>
+          <option value="nether">Незер</option>
+          <option value="end">Энд</option>
+        </select>
+        <select id="layerSelect" aria-label="Слой карты" hidden></select>
+        <div class="seg" id="modeSeg" role="group" aria-label="Вид карты" hidden>
+          <button type="button" data-mode="2d" class="on">2D</button><button type="button" data-mode="3d">3D</button>
+        </div>
+        <span class="coords mono" id="cursorCoords">X — · Z —</span>
+        <a class="btn" id="bluemapBtn" target="_blank" rel="noopener" hidden>BlueMap</a>
+        <button class="btn editor-only" id="fromSchemBtn">Карта из схематика</button>
+        <button class="btn editor-only" id="uploadMapBtn">Загрузить картинку</button>
+        <button class="btn primary editor-only" id="addSchemBtn">+ Схематик</button>
+      </div>
+      <div class="map-empty" id="mapEmpty" hidden>
+        <p>Карта города ещё не загружена, поэтому метки стоят на сетке координат.</p>
+        <p class="muted">Как её сделать, написано в задаче «Загрузить карту города».</p>
+      </div>
+    </section>
+
+    <!-- Схематики -->
+    <section class="view" id="view-schematics">
+      <div class="page">
+        <div class="page-head">
+          <h1>Схематики</h1>
+          <input type="search" id="schemSearch" placeholder="Поиск по названию или автору">
+          <button class="btn primary editor-only" id="addSchemBtn2">+ Загрузить</button>
+        </div>
+        <div class="schem-grid" id="schemList"></div>
+      </div>
+    </section>
+
+    <!-- Задачи -->
+    <section class="view" id="view-tasks">
+      <div class="page">
+        <div class="page-head">
+          <h1>Задачи</h1>
+          <button class="btn primary editor-only" id="addTaskBtn">+ Задача</button>
+        </div>
+        <div class="board">
+          <div class="column" data-status="todo"><h2>Нужно сделать <span class="count"></span></h2><div class="cards"></div></div>
+          <div class="column" data-status="doing"><h2>В работе <span class="count"></span></h2><div class="cards"></div></div>
+          <div class="column" data-status="done"><h2>Готово <span class="count"></span></h2><div class="cards"></div></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Панель схематика -->
+  <aside class="drawer" id="schemDrawer" hidden>
+    <button class="icon-btn close" data-close aria-label="Закрыть">×</button>
+    <div id="drawerBody"></div>
+  </aside>
+
+  <!-- Модалки -->
+  <dialog id="loginDialog">
+    <form method="dialog" class="form" id="loginForm">
+      <h2>Вход для редакторов</h2>
+      <p class="muted">Пароль выдаёт администратор города. Без входа сайт можно только смотреть и скачивать схематики.</p>
+      <label>Пароль<input type="password" name="password" required autocomplete="current-password"></label>
+      <p class="error" data-error></p>
+      <div class="actions"><button type="button" class="btn ghost" data-cancel>Отмена</button><button class="btn primary">Войти</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="schemDialog">
+    <form method="dialog" class="form" id="schemForm">
+      <h2>Новый схематик</h2>
+      <label>Файл<input type="file" name="file" accept=".schem,.litematic,.schematic,.nbt" required></label>
+      <p class="muted small" id="schemFileInfo">.schem, .litematic, .schematic или .nbt, до 25 МБ</p>
+      <label>Название<input name="name" required maxlength="120"></label>
+      <div class="row3">
+        <label>X<input name="x" type="number" step="1" required></label>
+        <label>Y<input name="y" type="number" step="1" required value="64"></label>
+        <label>Z<input name="z" type="number" step="1" required></label>
+      </div>
+      <p class="muted small">Подсказка: кликни правой кнопкой по карте, и X и Z подставятся сами.</p>
+      <label>Измерение
+        <select name="dimension"><option value="overworld">Верхний мир</option><option value="nether">Незер</option><option value="end">Энд</option></select>
+      </label>
+      <label>Автор<input name="author" maxlength="60"></label>
+      <label>Описание<textarea name="description" rows="3" maxlength="2000"></textarea></label>
+      <p class="error" data-error></p>
+      <div class="actions"><button type="button" class="btn ghost" data-cancel>Отмена</button><button class="btn primary">Загрузить</button></div>
+    </form>
+  </dialog>
+
+  <!-- Слой карты из готовой картинки -->
+  <dialog id="mapDialog">
+    <form method="dialog" class="form" id="mapForm">
+      <h2>Картинка карты</h2>
+      <p class="muted">Подойдёт PNG из uNmINeD или экспорт Xaero's World Map. Подробности в задаче «Загрузить карту города».</p>
+      <label>Слой<select name="layerId"></select></label>
+      <div class="row2">
+        <label>Название слоя<input name="name" maxlength="60" list="layerNames" placeholder="Подземный город"></label>
+        <label>Измерение<select name="dimension"><option value="overworld">Верхний мир</option><option value="nether">Незер</option><option value="end">Энд</option></select></label>
+      </div>
+      <label>Картинка (PNG, JPG или WebP до 25 МБ)<input type="file" name="image" accept="image/png,image/jpeg,image/webp"></label>
+      <p class="muted small" data-keep hidden>Оставь пустым, чтобы сдвинуть слой без замены картинки.</p>
+      <div class="row3">
+        <label>X левого верхнего угла<input name="originX" type="number" step="1" required></label>
+        <label>Z левого верхнего угла<input name="originZ" type="number" step="1" required></label>
+        <label>Блоков в пикселе<input name="scale" type="number" step="0.1" min="0.1" max="64" value="1" required></label>
+      </div>
+      <p class="error" data-error></p>
+      <div class="actions">
+        <button type="button" class="btn danger" data-delete hidden>Удалить слой</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn ghost" data-cancel>Отмена</button>
+        <button class="btn primary">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Слой карты из схематика всего города -->
+  <dialog id="fromSchemDialog" class="wide">
+    <form method="dialog" class="form" id="fromSchemForm">
+      <h2>Карта из схематика</h2>
+      <p class="muted">Загрузи схематик всего города, и сайт нарисует карту сверху. Для подземного города задай срез: потолок одного этажа как верх и пол как низ.</p>
+      <label>Схематик (.litematic или .schem)<input type="file" name="file" accept=".schem,.litematic" required></label>
+      <p class="muted small" data-info></p>
+      <fieldset data-needs-file disabled>
+        <p class="muted small">Координаты самого маленького угла: из Corner 1 и Corner 2 в Litematica возьми меньший X, меньший Y и меньший Z.</p>
+        <div class="row3">
+          <label>Мин. X<input name="minX" type="number" step="1" required></label>
+          <label>Мин. Y<input name="minY" type="number" step="1" required value="0"></label>
+          <label>Мин. Z<input name="minZ" type="number" step="1" required></label>
+        </div>
+        <div class="row2">
+          <label>Срез сверху, Y<input name="topY" type="number" step="1" required></label>
+          <label>Срез снизу, Y<input name="bottomY" type="number" step="1" required></label>
+        </div>
+        <div class="topdown" data-preview><span class="muted">Здесь появится карта</span></div>
+        <div class="row2">
+          <label>Слой<select name="layerId"></select></label>
+          <label>Название слоя<input name="name" maxlength="60" list="layerNames" value="Подземный город"></label>
+        </div>
+        <label>Измерение<select name="dimension"><option value="overworld">Верхний мир</option><option value="nether">Незер</option><option value="end">Энд</option></select></label>
+      </fieldset>
+      <p class="error" data-error></p>
+      <div class="actions"><button type="button" class="btn ghost" data-cancel>Отмена</button><button class="btn primary">Сохранить слой</button></div>
+    </form>
+  </dialog>
+  <datalist id="layerNames"><option value="Поверхность"><option value="Подземный город"><option value="Этаж 1"><option value="Этаж 2"></datalist>
+
+  <dialog id="taskDialog">
+    <form method="dialog" class="form" id="taskForm">
+      <h2 data-title>Задача</h2>
+      <label>Название<input name="title" required maxlength="200"></label>
+      <label>Описание<textarea name="description" rows="10" maxlength="5000"></textarea></label>
+      <div class="row2">
+        <label>Статус<select name="status"><option value="todo">Нужно сделать</option><option value="doing">В работе</option><option value="done">Готово</option></select></label>
+        <label>Исполнитель<input name="assignee" maxlength="60"></label>
+      </div>
+      <p class="error" data-error></p>
+      <div class="actions">
+        <button type="button" class="btn danger" data-delete hidden>Удалить</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn ghost" data-cancel>Закрыть</button>
+        <button class="btn primary">Сохранить</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

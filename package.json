@@ -1,0 +1,14 @@
+{
+  "name": "city-site",
+  "description": "Сайт города: карта, схематики и задачи",
+  "scripts": {
+    "dev": "wrangler pages dev public --d1 DB --kv FILES --binding EDIT_PASSWORD=test"
+  },
+  "devDependencies": {
+    "leaflet": "^1.9.4",
+    "three": "^0.160.0",
+    "wrangler": "^3.114.17"
+  },
+  "type": "module",
+  "private": true
+}
