@@ -1,6 +1,8 @@
 // Чтение схематиков в браузере: .schem (Sponge v2/v3) и .litematic.
-// Возвращает { width, height, length, blocks, palette }, где
+// Возвращает { width, height, length, blocks, palette, states }, где
 // индекс блока = x + z*width + y*width*length, а blocks[i] — номер в palette.
+// palette — имена блоков без свойств (minecraft:oak_stairs), states — полные состояния
+// (minecraft:oak_stairs[facing=east,half=bottom,...]) для текстур.
 import { blockColor, isSeeThrough, isNatural, isAir } from './blocks.js';
 
 const MAX_VOLUME = 150_000_000; // больше браузер обычно не вытягивает по памяти
@@ -83,8 +85,8 @@ function parseSponge(root) {
   const paletteObj = container.Palette;
   const data = container.Data || container.BlockData;
   if (!paletteObj || !data) throw new Error('У схематику немає блоків');
-  const palette = [];
-  for (const [state, idx] of Object.entries(paletteObj)) palette[idx] = baseName(state);
+  const palette = [], states = [];
+  for (const [state, idx] of Object.entries(paletteObj)) { palette[idx] = baseName(state); states[idx] = state; }
   if (palette.length > 65535) throw new Error('Забагато різних блоків');
   const blocks = allocBlocks(width, height, length);
   // Номера блоков записаны как varint.
@@ -95,7 +97,7 @@ function parseSponge(root) {
     do { b = data[p++]; value |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
     blocks[i++] = value;
   }
-  return { width, height, length, blocks, palette };
+  return { width, height, length, blocks, palette, states };
 }
 
 function parseLitematic(root) {
@@ -117,15 +119,16 @@ function parseLitematic(root) {
   const height = Math.max(...boxes.map((b) => b.y0 + b.sy)) - minY;
   const length = Math.max(...boxes.map((b) => b.z0 + b.sz)) - minZ;
 
-  const palette = ['minecraft:air'];
+  const palette = ['minecraft:air'], states = ['minecraft:air'];
   const paletteIndex = new Map([['minecraft:air', 0]]);
   const blocks = allocBlocks(width, height, length);
 
   for (const b of boxes) {
     const pal = (b.r.BlockStatePalette || []).map((e) => {
-      const name = e.Name;
-      if (!paletteIndex.has(name)) { paletteIndex.set(name, palette.length); palette.push(name); }
-      return paletteIndex.get(name);
+      const props = Object.entries(e.Properties || {}).sort(([a], [b]) => (a < b ? -1 : 1));
+      const state = props.length ? `${e.Name}[${props.map(([k, v]) => `${k}=${v}`).join(',')}]` : e.Name;
+      if (!paletteIndex.has(state)) { paletteIndex.set(state, palette.length); palette.push(e.Name); states.push(state); }
+      return paletteIndex.get(state);
     });
     const words = b.r.BlockStates; // поток бит, младшие биты первыми
     if (!words || !pal.length) continue;
@@ -146,7 +149,7 @@ function parseLitematic(root) {
     }
   }
   if (palette.length > 65535) throw new Error('Забагато різних блоків');
-  return { width, height, length, blocks, palette };
+  return { width, height, length, blocks, palette, states };
 }
 
 export async function parseSchematic(buffer, fileName) {
@@ -211,4 +214,25 @@ export function renderTopDown(schem, { topY = schem.height - 1, bottomY = 0 } = 
   }
   ctx.putImageData(img, 0, 0);
   return canvas;
+}
+
+// Зріз за замовчуванням: висоти, де стоять збудовані (не природні) блоки.
+// Для підземного міста це від підлоги до верху найвищих будинків, без скелі над печерою.
+export function suggestSlice(schem) {
+  const { width: W, height: H, length: L, blocks, palette } = schem;
+  const built = palette.map((n) => !isAir(n) && !isNatural(n));
+  const WL = W * L;
+  const counts = new Uint32Array(H);
+  for (let y = 0; y < H; y++) {
+    let c = 0;
+    for (let i = y * WL, end = i + WL; i < end; i++) if (built[blocks[i]]) c++;
+    counts[y] = c;
+  }
+  const max = Math.max(...counts);
+  if (!max) return null;
+  const enough = (y) => counts[y] >= max * 0.01;
+  let top = H - 1, bottom = 0;
+  while (top > 0 && !enough(top)) top--;
+  while (bottom < top && !enough(bottom)) bottom++;
+  return { top, bottom: Math.max(0, bottom - 1) }; // на шар нижче, щоб підлога точно потрапила
 }

@@ -314,8 +314,10 @@ fieldset:disabled { opacity: .45; }
   background: var(--void) repeating-conic-gradient(#0a1619 0 25%, #071013 0 50%) 0 0 / 16px 16px;
 }
 .topdown canvas { width: 100%; height: 100%; object-fit: contain; image-rendering: pixelated; }
-/* Карта из блоков должна оставаться чёткой при приближении. */
+.topdown canvas.smooth { image-rendering: auto; }
+/* Карта из блоков должна оставаться чёткой при приближении, а уменьшенная мапа с текстурами не рябить. */
 .leaflet-image-layer { image-rendering: pixelated; }
+.map-smooth .leaflet-image-layer { image-rendering: auto; }
 
 .toast {
   position: fixed; bottom: 22px; left: 50%; transform: translateX(-50%); z-index: 3000;

@@ -1,4 +1,4 @@
-import { parseSchematic, renderTopDown, naturalShare } from './schem.js';
+import { parseSchematic, renderTopDown, naturalShare, suggestSlice } from './schem.js';
 import { CONFIG } from './config.js';
 
 const $ = (s, el = document) => el.querySelector(s);
@@ -172,6 +172,12 @@ function renderLayerSelect() {
   sel.value = cur ? cur.id : '';
 }
 
+function syncSmoothing() {
+  const layer = currentLayer();
+  map.getContainer().classList.toggle('map-smooth', !!layer && 2 ** map.getZoom() * layer.scale < 1);
+}
+map.on('zoomend', syncSmoothing);
+
 function renderCityMap() {
   if (cityImage) { cityImage.remove(); cityImage = null; }
   renderLayerSelect();
@@ -182,6 +188,7 @@ function renderCityMap() {
   cityImage = L.imageOverlay(`/api/map/${encodeURIComponent(layer.id)}/image?v=${layer.version}`, layerBounds(layer))
     .addTo(map);
   grid.bringToFront();
+  syncSmoothing();
 }
 
 function renderMarkers() {
@@ -261,6 +268,13 @@ function v3dStatus(text) {
   el.textContent = text || '';
 }
 
+// Середні кольори блоків із текстур гри: зберігаються, коли мапу малюють із .jar. Потрібні для 3D.
+let blockColorsCache = null;
+function getBlockColors() {
+  blockColorsCache ??= fetch('/api/colors').then((r) => (r.ok ? r.json() : {})).catch(() => ({}));
+  return blockColorsCache;
+}
+
 async function show3d() {
   const layer = currentLayer();
   if (!layer?.model) return setMode('2d');
@@ -268,18 +282,20 @@ async function show3d() {
   try {
     if (v3d.key !== key) {
       v3dStatus('Завантажую 3D-модель міста…');
-      const [{ createViewer }, buf] = await Promise.all([
+      const [{ createViewer }, buf, colors] = await Promise.all([
         import('./voxel.js'),
         fetch(`/api/map/${encodeURIComponent(layer.id)}/model?v=${layer.model.version}`).then((r) => {
           if (!r.ok) throw new Error('модель не знайдено');
           return r.arrayBuffer();
         }),
+        getBlockColors(),
       ]);
       v3dStatus('Будую місто з блоків…');
       await new Promise((r) => setTimeout(r, 30));
       const schem = await parseSchematic(buf, layer.model.fileName);
       v3d.viewer ??= createViewer($('#v3dCanvas'));
       v3d.schem = schem;
+      v3d.colors = colors;
       v3d.layer = layer;
       v3d.key = key;
       $('#v3dRock').checked = naturalShare(schem) > 0.4;
@@ -299,7 +315,7 @@ async function show3d() {
 }
 
 function build3d(keepView) {
-  v3d.viewer.setModel(v3d.schem, { hideNatural: $('#v3dRock').checked, keepView });
+  v3d.viewer.setModel(v3d.schem, { hideNatural: $('#v3dRock').checked, keepView, colors: v3d.colors });
   applyClip();
 }
 function applyClip() {
@@ -412,13 +428,22 @@ $('#mapForm [data-delete]').addEventListener('click', async () => {
 });
 
 // --- Слой из схематика всего города ---
-const fromSchem = { schem: null, file: null, timer: 0 };
+// Текстуры из файла игры подгружаются отдельным модулем: он нужен только редактору.
+const fromSchem = { schem: null, file: null, timer: 0, assets: null, texName: '', tiles: null, job: 0 };
+const loadTextures = () => import('./textures.js');
+const MB = 1024 * 1024;
+const TEX_HINT = $('#fromSchemForm [data-tex-info]').innerHTML;
+
 $('#fromSchemBtn').addEventListener('click', () => {
   const f = $('#fromSchemForm');
   f.reset();
   fromSchem.schem = null;
+  fromSchem.tiles = null;
   $('fieldset', f).disabled = true;
   $('[data-info]', f).textContent = 'Велике місто може читатися кілька секунд.';
+  $('[data-save-status]', f).textContent = '';
+  if (fromSchem.assets) $('[data-tex-info]', f).textContent = `Текстури вже вибрано: ${fromSchem.texName}. Можна вибрати інший файл.`;
+  else $('[data-tex-info]', f).innerHTML = TEX_HINT;
   $('[data-preview]', f).innerHTML = '<span class="muted">Тут з’явиться мапа</span>';
   fillLayerSelect(f.layerId);
   const underground = state.layers.find((l) => /підзем|подзем/i.test(l.name));
@@ -427,12 +452,16 @@ $('#fromSchemBtn').addEventListener('click', () => {
   fillCorner(f, underground);
   openDialog('#fromSchemDialog');
 });
-// Шар зі схематика пам’ятає свій найменший кут, тож при перемальовуванні координати вже стоять.
+// Шар зі схематика пам’ятає свій найменший кут і зріз, тож при перемальовуванні все вже стоїть.
 function fillCorner(f, layer) {
   if (!layer?.model) return;
   f.minX.value = layer.originX;
   f.minY.value = layer.model.minY;
   f.minZ.value = layer.originZ;
+  if (layer.model.sliceTop !== undefined) {
+    f.topY.value = layer.model.sliceTop;
+    f.bottomY.value = layer.model.sliceBottom;
+  }
 }
 
 $('#fromSchemForm').file.addEventListener('change', async (e) => {
@@ -440,6 +469,7 @@ $('#fromSchemForm').file.addEventListener('change', async (e) => {
   const file = e.target.files[0];
   const info = $('[data-info]', f);
   fromSchem.schem = null;
+  fromSchem.tiles = null;
   $('fieldset', f).disabled = true;
   if (!file) return;
   info.textContent = 'Читаю схематик…';
@@ -450,11 +480,17 @@ $('#fromSchemForm').file.addEventListener('change', async (e) => {
     fromSchem.schem = schem;
     fromSchem.file = file;
     info.textContent = `${schem.width}×${schem.height}×${schem.length} блоків (ширина × висота × довжина).`;
+    // Зріз: збережений у шарі, інакше від підлоги до верху будинків.
     const minY = Number(f.minY.value) || 0;
-    f.topY.value = minY + schem.height - 1;
-    f.bottomY.value = minY;
+    const inside = (v) => v !== '' && Number(v) >= minY && Number(v) <= minY + schem.height - 1;
+    if (!inside(f.topY.value) || !inside(f.bottomY.value)) {
+      const s = suggestSlice(schem) || { top: schem.height - 1, bottom: 0 };
+      f.topY.value = minY + s.top;
+      f.bottomY.value = minY + s.bottom;
+    }
     $('fieldset', f).disabled = false;
     drawFromSchemPreview();
+    prepareTiles(f);
   } catch (err) {
     console.error(err);
     info.textContent = '';
@@ -462,19 +498,61 @@ $('#fromSchemForm').file.addEventListener('change', async (e) => {
   }
 });
 
-function fromSchemCanvas() {
+$('#fromSchemForm').textures.addEventListener('change', async (e) => {
+  const f = e.target.form;
+  const files = [...e.target.files];
+  const info = $('[data-tex-info]', f);
+  if (!files.length) return;
+  fromSchem.assets = null;
+  fromSchem.tiles = null;
+  info.textContent = 'Відкриваю файл гри…';
+  try {
+    const { openPacks } = await loadTextures();
+    fromSchem.assets = await openPacks(files);
+    fromSchem.texName = fromSchem.assets.version ? `Minecraft ${fromSchem.assets.version}` : files.map((x) => x.name).join(', ');
+    info.textContent = `Текстури: ${fromSchem.texName}.` + (fromSchem.schem ? '' : ' Тепер вибери схематик.');
+    await prepareTiles(f);
+  } catch (err) {
+    console.error(err);
+    info.textContent = 'Не вдалося прочитати текстури: ' + err.message;
+  }
+});
+
+// Плитки «вид згори» для кожного блока схематика. Готуються раз на пару «схематик + текстури».
+async function prepareTiles(f) {
+  if (!fromSchem.schem || !fromSchem.assets) return;
+  const job = ++fromSchem.job;
+  const info = $('[data-tex-info]', f);
+  const { buildTiles, pickPx } = await loadTextures();
+  const schem = fromSchem.schem;
+  const tiles = await buildTiles(fromSchem.assets, schem.states, (done, total) => {
+    if (job === fromSchem.job) info.textContent = `Збираю блоки з текстур: ${done} з ${total}…`;
+  });
+  if (job !== fromSchem.job || schem !== fromSchem.schem) return; // поки збирали, вибрали інший файл
+  fromSchem.tiles = tiles;
+  const px = pickPx(schem.width, schem.length);
+  info.textContent = `Текстури: ${fromSchem.texName}. Мапа буде ${px} пікс. на блок (${schem.width * px}×${schem.length * px}).`
+    + (tiles.missing ? ` Блоків без текстури (з модів): ${tiles.missing}, вони будуть кольорові.` : '');
+  drawFromSchemPreview();
+}
+
+async function fromSchemCanvas(px) {
   const f = $('#fromSchemForm');
   const minY = Number(f.minY.value) || 0;
-  return renderTopDown(fromSchem.schem, {
-    topY: Number(f.topY.value) - minY,
-    bottomY: Number(f.bottomY.value) - minY,
-  });
+  const opts = { topY: Number(f.topY.value) - minY, bottomY: Number(f.bottomY.value) - minY };
+  if (!fromSchem.tiles) return renderTopDown(fromSchem.schem, opts);
+  const { renderTextured } = await loadTextures();
+  return renderTextured(fromSchem.schem, fromSchem.tiles, { ...opts, px });
 }
-function drawFromSchemPreview() {
+async function drawFromSchemPreview() {
   if (!fromSchem.schem) return;
+  const { width: W, length: L } = fromSchem.schem;
+  const px = fromSchem.tiles ? (await loadTextures()).pickPx(W, L, 4, 1.5e6) : 1;
+  const canvas = await fromSchemCanvas(px);
+  canvas.classList.toggle('smooth', px > 1); // зменшене прев’ю з текстурами згладжуємо, щоб не рябіло
   const box = $('#fromSchemForm [data-preview]');
   box.innerHTML = '';
-  box.appendChild(fromSchemCanvas());
+  box.appendChild(canvas);
 }
 for (const name of ['minY', 'topY', 'bottomY']) {
   $('#fromSchemForm')[name].addEventListener('input', () => {
@@ -486,37 +564,74 @@ $('#fromSchemForm').layerId.addEventListener('change', (e) => {
   const layer = state.layers.find((l) => l.id === e.target.value);
   if (layer) { e.target.form.name.value = layer.name; e.target.form.dimension.value = layer.dimension; }
   fillCorner(e.target.form, layer);
+  drawFromSchemPreview();
 });
+
+// Картинка мапи для сховища (до 24 МБ): маленька — PNG без втрат, велика — WebP, де його немає — JPEG.
+async function encodeMap(canvas) {
+  const toBlob = (type, q) => new Promise((r) => canvas.toBlob(r, type, q));
+  if (canvas.width * canvas.height <= 4e6) {
+    const png = await toBlob('image/png');
+    if (png && png.size <= 24 * MB) return png;
+  }
+  const webp = await toBlob('image/webp', 0.9);
+  if (webp && webp.type === 'image/webp' && webp.size <= 24 * MB) return webp;
+  return toBlob('image/jpeg', 0.9);
+}
 
 $('#fromSchemForm').addEventListener('submit', (e) => {
   e.preventDefault();
   const form = e.target;
+  const status = $('[data-save-status]', form);
   withBusy(form, async () => {
     if (!fromSchem.schem) throw new Error('Спершу вибери схематик');
     if (Number(form.topY.value) < Number(form.bottomY.value)) throw new Error('Верх зрізу має бути вище за низ');
-    const canvas = fromSchemCanvas();
-    let blob = await new Promise((r) => canvas.toBlob(r, 'image/png'));
-    let type = 'image/png';
-    if (blob.size > 24 * 1024 * 1024) {
-      blob = await new Promise((r) => canvas.toBlob(r, 'image/webp', 0.95));
-      type = 'image/webp';
+    const { width: W, length: L } = fromSchem.schem;
+    const tx = fromSchem.tiles ? await loadTextures() : null;
+    let px = tx ? tx.pickPx(W, L) : 1;
+    let canvas, blob;
+    try {
+      for (;;) {
+        status.textContent = `Малюю мапу ${W * px}×${L * px}…`;
+        await new Promise((r) => setTimeout(r, 30));
+        try {
+          canvas = await fromSchemCanvas(px);
+          status.textContent = 'Стискаю картинку…';
+          blob = await encodeMap(canvas);
+        } catch (err) {
+          if (px === 1) throw err;
+          console.warn(err); // браузер не потягнув такий розмір (так буває в Safari): пробуємо менший
+          blob = null;
+        }
+        if (blob && blob.size <= 24 * MB) break;
+        if (px === 1) throw new Error('Мапа вийшла більшою за 24 МБ. Зменш схематик або розділи місто на частини');
+        px /= 2; // не влізло: удвічі менше пікселів на блок
+      }
+      const ext = { 'image/png': 'png', 'image/webp': 'webp', 'image/jpeg': 'jpg' }[blob.type] || 'png';
+      const fd = new FormData();
+      fd.set('image', new File([blob], `map.${ext}`, { type: blob.type }));
+      fd.set('layerId', form.layerId.value);
+      fd.set('name', form.name.value || 'Підземне місто');
+      fd.set('dimension', form.dimension.value);
+      fd.set('originX', form.minX.value);
+      fd.set('originZ', form.minZ.value);
+      fd.set('scale', 1 / px);
+      fd.set('width', canvas.width);
+      fd.set('height', canvas.height);
+      fd.set('model', fromSchem.file);
+      fd.set('modelMinY', form.minY.value);
+      fd.set('sliceTop', form.topY.value);
+      fd.set('sliceBottom', form.bottomY.value);
+      if (tx) fd.set('colors', JSON.stringify(tx.blockColors(fromSchem.schem, fromSchem.tiles)));
+      status.textContent = `Завантажую ${(blob.size / MB).toFixed(1)} МБ…`;
+      const layer = await api('map', { method: 'POST', body: fd });
+      blockColorsCache = null;
+      form.closest('dialog').close();
+      await showSavedLayer(layer);
+      toast(`Шар «${layer.name}» збережено`);
+    } finally {
+      status.textContent = '';
     }
-    const fd = new FormData();
-    fd.set('image', new File([blob], type === 'image/png' ? 'map.png' : 'map.webp', { type }));
-    fd.set('layerId', form.layerId.value);
-    fd.set('name', form.name.value || 'Підземне місто');
-    fd.set('dimension', form.dimension.value);
-    fd.set('originX', form.minX.value);
-    fd.set('originZ', form.minZ.value);
-    fd.set('scale', 1);
-    fd.set('width', canvas.width);
-    fd.set('height', canvas.height);
-    fd.set('model', fromSchem.file);
-    fd.set('modelMinY', form.minY.value);
-    const layer = await api('map', { method: 'POST', body: fd });
-    form.closest('dialog').close();
-    await showSavedLayer(layer);
-    toast(`Шар «${layer.name}» збережено`);
   });
 });
 
@@ -616,12 +731,13 @@ async function openSchematic(id) {
     return;
   }
   try {
-    const [buf, { createViewer }] = await Promise.all([
+    const [buf, { createViewer }, colors] = await Promise.all([
       fetch(`/api/schematics/${s.id}/file?preview`).then((r) => {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.arrayBuffer();
       }),
       import('./voxel.js'),
+      getBlockColors(),
     ]);
     const parsed = await parseSchematic(buf, s.file_name);
     if (!box.isConnected) return;
@@ -634,7 +750,7 @@ async function openSchematic(id) {
     box.after(toggle);
     box.innerHTML = '';
     preview = createViewer(box, { fog: false });
-    const draw = () => preview.setModel(parsed, { hideNatural: cb.checked, keepView: true });
+    const draw = () => preview.setModel(parsed, { hideNatural: cb.checked, keepView: true, colors });
     cb.addEventListener('change', draw);
     draw();
   } catch (err) {

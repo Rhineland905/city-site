@@ -126,6 +126,7 @@ export async function onRequest({ request, env, params }) {
     if (section === 'schematics') return await schematics(request, env, method, id, action);
     if (section === 'tasks') return await tasks(request, env, method, id);
     if (section === 'map') return await map(request, env, method, id, action);
+    if (section === 'colors' && method === 'GET') return json(await getColors(env));
     return fail(404, 'Не знайдено');
   } catch (e) {
     console.error(e);
@@ -256,6 +257,30 @@ async function saveLayers(env, layers) {
   ).bind(JSON.stringify(layers)).run();
 }
 
+// Середні кольори блоків (верх і бік), пораховані в браузері з текстур гри. Ними фарбується 3D.
+// Самі текстури на сайт не потрапляють.
+async function getColors(env) {
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'block_colors'").first();
+  return row ? JSON.parse(row.value) : {};
+}
+async function mergeColors(env, raw) {
+  if (raw.length > 200_000) return;
+  let incoming;
+  try { incoming = JSON.parse(raw); } catch { return; }
+  if (!incoming || typeof incoming !== 'object') return;
+  const colors = await getColors(env);
+  const hex = /^#[0-9a-f]{6}$/;
+  for (const [name, pair] of Object.entries(incoming)) {
+    if (/^[a-z0-9_.-]{1,40}:[a-z0-9_./-]{1,80}$/.test(name) && Array.isArray(pair) && pair.length === 2 && pair.every((c) => hex.test(c))) {
+      colors[name] = pair;
+    }
+  }
+  const all = Object.entries(colors).slice(-3000); // з запасом на моди
+  await env.DB.prepare(
+    "INSERT INTO settings (key, value) VALUES ('block_colors', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+  ).bind(JSON.stringify(Object.fromEntries(all))).run();
+}
+
 async function map(request, env, method, id, action) {
   if (method === 'GET' && !id) return json(await getLayers(env));
 
@@ -293,7 +318,8 @@ async function map(request, env, method, id, action) {
     const originX = int(form.get('originX')), originZ = int(form.get('originZ'));
     const scale = Number(form.get('scale'));
     if (originX === null || originZ === null) return fail(400, 'Вкажи X і Z лівого верхнього кута');
-    if (!(scale >= 0.1 && scale <= 64)) return fail(400, 'Масштаб від 0.1 до 64 блоків на піксель');
+    // Карта з текстурами має 16 пікселів на блок, тобто масштаб 1/16.
+    if (!(scale >= 1 / 64 && scale <= 64)) return fail(400, 'Масштаб від 1/64 до 64 блоків на піксель');
 
     const file = form.get('image');
     const hasFile = file && typeof file !== 'string' && file.size > 0;
@@ -318,6 +344,9 @@ async function map(request, env, method, id, action) {
       const minY = int(form.get('modelMinY'));
       if (minY === null) return fail(400, 'Вкажи нижню висоту схематика');
       modelInfo = { fileName: str(model.name, 200), format: ext, minY, version: Date.now() };
+      // Зріз, з якого намальована мапа: наступного разу діалог підставить його сам.
+      const sliceTop = int(form.get('sliceTop')), sliceBottom = int(form.get('sliceBottom'));
+      if (sliceTop !== null && sliceBottom !== null) Object.assign(modelInfo, { sliceTop, sliceBottom });
     } else if (hasFile) {
       modelInfo = null; // новая картинка не из схематика: старая модель больше не совпадает
     }
@@ -334,6 +363,8 @@ async function map(request, env, method, id, action) {
     if (hasModel) await env.FILES.put(`model:${layer.id}`, await model.arrayBuffer());
     else if (!modelInfo && existing?.model) await env.FILES.delete(`model:${layer.id}`);
     await saveLayers(env, existing ? layers.map((l) => (l.id === layer.id ? layer : l)) : [...layers, layer]);
+    const colors = form.get('colors');
+    if (typeof colors === 'string' && colors) await mergeColors(env, colors);
     return json(layer, existing ? 200 : 201);
   }
 
