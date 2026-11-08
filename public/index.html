@@ -55,6 +55,7 @@
         <span class="coords mono" id="cursorCoords">X — · Z —</span>
         <a class="btn" id="bluemapBtn" target="_blank" rel="noopener" hidden>BlueMap</a>
         <button class="btn" id="markersBtn" aria-expanded="false" aria-controls="markersPanel">Мітки</button>
+        <button class="btn live-btn" id="liveBtn" title="Мод, який сам оновлює мапу з гри"><span class="live-dot" aria-hidden="true"></span>Жива мапа</button>
         <button class="btn editor-only" id="addMarkerBtn">+ Мітка</button>
         <button class="btn editor-only" id="fromSchemBtn">Мапа зі схематика</button>
         <button class="btn editor-only" id="uploadMapBtn">Завантажити картинку</button>
@@ -70,6 +71,7 @@
         <p class="muted small editor-only markers-tip">Щоб поставити мітку, натисни «+ Мітка» і клацни на мапі. Мітку можна перетягнути.</p>
       </aside>
       <div class="place-hint" id="placeHint" hidden>Клацни на мапі, де поставити мітку. <button type="button" class="btn ghost" id="placeCancel">Скасувати</button></div>
+      <div class="place-hint" id="areaHint" hidden><span data-text></span> <button type="button" class="btn ghost" id="areaCancel">Скасувати</button></div>
       <div class="map-empty" id="mapEmpty" hidden>
         <p>Мапу міста ще не завантажено, тому мітки стоять на сітці координат.</p>
         <p class="muted">Як її зробити, написано в завданні «Завантажити мапу міста».</p>
@@ -227,6 +229,61 @@
         <button type="button" class="btn danger" data-delete hidden>Видалити</button>
         <span class="spacer"></span>
         <button type="button" class="btn ghost" data-cancel>Закрити</button>
+        <button class="btn primary">Зберегти</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Жива мапа: мод для гри, який сам домальовує мапу -->
+  <dialog id="liveDialog" class="wide">
+    <div class="form">
+      <h2>Жива мапа</h2>
+      <p>Мод для Minecraft 26.3 сам оновлює мапу. Коли гравець із модом ходить містом, прогружені чанки за хвилину з’являються тут поверх мапи, з текстурами як у грі.</p>
+      <p class="live-status" id="liveStatus"></p>
+      <div class="live-download">
+        <a class="btn primary" id="modDownload" href="mod/city-map.jar" download>Скачати мод</a>
+        <span class="live-note">city-map.jar · Fabric · Minecraft 26.3</span>
+      </div>
+      <ol class="steps">
+        <li>Постав <a href="https://fabricmc.net/use/installer/" target="_blank" rel="noopener">Fabric Loader</a> для 26.3 і мод <a href="https://modrinth.com/mod/fabric-api" target="_blank" rel="noopener">Fabric API</a>.</li>
+        <li>Поклади <span class="mono">city-map.jar</span> у папку <span class="mono">.minecraft/mods</span>.</li>
+        <li>Зайди на сервер і напиши в чат <span class="mono">/citymap key КЛЮЧ</span>. Ключ дає редактор сайту.</li>
+        <li>Просто грай: чанки, які ти прогрузив у межах мапи, самі з’являться тут. <span class="mono">/citymap</span> покаже стан, <span class="mono">/citymap off</span> вимкне мод.</li>
+      </ol>
+      <section class="live-admin editor-only">
+        <h3>Для редакторів</h3>
+        <div class="live-key" id="liveKeyBox"></div>
+        <div class="live-layers" id="liveLayers"></div>
+        <p class="live-note">Мод малює блоки від «згори» до «знизу», як «Мапа зі схематика». Якщо змінити зріз, старі чанки зітруться, і мод намалює їх заново. Області додають територію за межами мапи, а свій зріз у області показує поверх нижче чи вище.</p>
+      </section>
+      <p class="error" data-error></p>
+      <div class="actions"><button type="button" class="btn ghost" data-cancel>Закрити</button></div>
+    </div>
+  </dialog>
+
+  <dialog id="areaDialog">
+    <form method="dialog" class="form" id="areaForm">
+      <h2 data-title>Область</h2>
+      <p class="live-note">Мод оновлює все, що потрапляє в область, навіть за межами мапи міста. Межі рівняються до чанків.</p>
+      <label>Назва<input name="name" maxlength="60" placeholder="Наприклад, нижній поверх шахти"></label>
+      <div class="row2">
+        <label>X від<input name="minX" type="number" step="1" required></label>
+        <label>X до<input name="maxX" type="number" step="1" required></label>
+      </div>
+      <div class="row2">
+        <label>Z від<input name="minZ" type="number" step="1" required></label>
+        <label>Z до<input name="maxZ" type="number" step="1" required></label>
+      </div>
+      <div class="row2">
+        <label>Зріз згори, Y<input name="top" type="number" step="1" required></label>
+        <label>знизу, Y<input name="bottom" type="number" step="1" required></label>
+      </div>
+      <p class="live-note" data-size></p>
+      <p class="error" data-error></p>
+      <div class="actions">
+        <button type="button" class="btn danger" data-delete hidden>Видалити</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn ghost" data-cancel>Скасувати</button>
         <button class="btn primary">Зберегти</button>
       </div>
     </form>

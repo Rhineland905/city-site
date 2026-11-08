@@ -52,9 +52,10 @@ const isEditor = () => document.body.classList.contains('editor');
 function setEditor(on) {
   document.body.classList.toggle('editor', on);
   $('#loginBtn').textContent = on ? 'Вийти' : 'Увійти';
-  if (!on) { state.password = ''; store.set('editPassword', null); setPlacing(false); }
+  if (!on) { state.password = ''; store.set('editPassword', null); setPlacing(false); stopAreaDraw(); }
   renderPins(); // редактор може перетягувати мітки
   renderMarkersList();
+  renderAreas();
 }
 
 $('#loginBtn').addEventListener('click', () => {
@@ -82,7 +83,8 @@ $('#loginForm').addEventListener('submit', async (e) => {
 // ---------- Диалоги ----------
 function openDialog(sel) {
   const d = $(sel);
-  showError($('form', d), '');
+  const err = $('[data-error]', d);
+  if (err) err.textContent = '';
   d.showModal();
   return d;
 }
@@ -186,11 +188,12 @@ function renderCityMap() {
   syncMode();
   $('#mapEmpty').hidden = state.layers.length > 0 || state.dim !== 'overworld';
   const layer = currentLayer();
-  if (!layer) return;
+  if (!layer) { syncLive(); return; }
   cityImage = L.imageOverlay(`/api/map/${encodeURIComponent(layer.id)}/image?v=${layer.version}`, layerBounds(layer))
     .addTo(map);
   grid.bringToFront();
   syncSmoothing();
+  syncLive();
 }
 
 function renderMarkers() {
@@ -394,6 +397,7 @@ function flyToMarker(m) {
 // --- Поставити мітку: «+ Мітка», потім клік по мапі ---
 let placing = false;
 function setPlacing(on) {
+  if (on) stopAreaDraw();
   placing = on;
   map.getContainer().classList.toggle('placing', on);
   $('#placeHint').hidden = !on;
@@ -471,6 +475,511 @@ $('#markerForm [data-delete]').addEventListener('click', async () => {
   } catch (err) { showError(form, err.message); }
 });
 
+// ---------- Жива мапа ----------
+// Мод у грі малює чанки, які прогрузив гравець, і надсилає їх на сайт. Тут вони лягають поверх мапи:
+// здалеку мініатюри 16×16 (піксель на блок), зблизька картинки 256×256 (16 пікселів на блок, як у грі).
+const live = {
+  layerId: null, epoch: null, since: 0, busy: false, polledAt: 0,
+  tiles: new Map(), // 'cx,cz' → { hash, at, player }
+  minis: new Map(), // 'cx,cz' → 1024 байти RGBA
+  imgs: new Map(), // 'cx,cz' → <img> на мапі
+  blocks: new Map(), // огляд здалеку: 'bx,bz' → { overlay, url }, квадрат 32×32 чанки
+  gen: 0,
+};
+const OV = 32;
+const liveKey = (cx, cz) => cx + ',' + cz;
+const liveTileUrl = (cx, cz) =>
+  `/api/live/${encodeURIComponent(live.layerId)}/tile/${cx}/${cz}?h=${live.tiles.get(liveKey(cx, cz)).hash}`;
+
+// На масштабі 4 один тайл Leaflet (256 px) — це рівно один чанк, тож координати тайла й чанка збігаються.
+const LiveTiles = L.GridLayer.extend({
+  createTile(coords, done) {
+    const img = document.createElement('img');
+    img.alt = '';
+    const key = liveKey(coords.x, coords.y);
+    live.imgs.set(key, img);
+    if (live.tiles.has(key)) loadLiveImg(img, coords.x, coords.y, done);
+    else { img.style.visibility = 'hidden'; setTimeout(() => done(null, img), 0); }
+    return img;
+  },
+});
+function loadLiveImg(img, cx, cz, done) {
+  img.onload = () => { img.style.visibility = ''; done?.(null, img); };
+  img.onerror = () => { img.style.visibility = 'hidden'; done?.(null, img); };
+  img.src = liveTileUrl(cx, cz);
+}
+const liveTiles = new LiveTiles({
+  pane: 'overlayPane', tileSize: 256, minNativeZoom: 4, maxNativeZoom: 4, minZoom: 3, className: 'live-tiles', zIndex: 2,
+});
+liveTiles.on('tileunload', (e) => {
+  const key = liveKey(e.coords.x, e.coords.y);
+  if (live.imgs.get(key) === e.tile) live.imgs.delete(key);
+});
+const syncLiveSmoothing = () => map.getContainer().classList.toggle('live-soft', map.getZoom() < 4);
+map.on('zoomend', syncLiveSmoothing);
+syncLiveSmoothing();
+
+// Вмикає живий шар для поточного шару мапи (або прибирає, якщо там жива мапа вимкнена).
+function syncLive() {
+  const layer = v3d.mode === '3d' ? null : currentLayer();
+  const id = layer?.live ? layer.id : null;
+  if (id !== live.layerId) {
+    live.layerId = id;
+    resetLive(layer?.live?.epoch ?? null);
+    if (map.hasLayer(liveTiles)) liveTiles.remove();
+    if (id) { liveTiles.addTo(map); pollLive(); }
+  } else {
+    for (const b of live.blocks.values()) b.overlay.bringToFront();
+  }
+  grid.bringToFront();
+  renderLiveBadge();
+  renderAreas();
+}
+function resetLive(epoch) {
+  live.epoch = epoch;
+  live.since = 0;
+  live.gen++;
+  live.tiles.clear();
+  live.minis.clear();
+  for (const b of live.blocks.values()) { b.overlay.remove(); URL.revokeObjectURL(b.url); }
+  live.blocks.clear();
+}
+
+async function pollLive() {
+  if (!live.layerId || live.busy) return;
+  live.busy = true;
+  try {
+    for (let round = 0; round < 2; round++) {
+      const id = live.layerId, since = live.since;
+      const data = await api(`live/${encodeURIComponent(id)}?since=${since}`);
+      if (id !== live.layerId) return;
+      if ((data.live?.epoch ?? null) !== live.epoch) {
+        // Чанки стерли або змінили зріз: починаємо спочатку.
+        resetLive(data.live?.epoch ?? null);
+        liveTiles.redraw();
+        if (data.live) continue;
+        return;
+      }
+      const changed = [];
+      for (const [cx, cz, hash, at, player] of data.tiles) {
+        const key = liveKey(cx, cz);
+        if (live.tiles.get(key)?.hash !== hash) changed.push([cx, cz]);
+        live.tiles.set(key, { hash, at, player });
+        if (at > live.since) live.since = at;
+      }
+      if (!changed.length) return;
+      const res = await fetch(`/api/live/${encodeURIComponent(id)}/minis?since=${since}`, { cache: 'no-store' });
+      if (!res.ok) throw new Error('Помилка ' + res.status);
+      const buf = await res.arrayBuffer();
+      if (id !== live.layerId) return;
+      const dv = new DataView(buf);
+      const got = [];
+      for (let o = 0; o + 1032 <= buf.byteLength; o += 1032) {
+        const cx = dv.getInt32(o), cz = dv.getInt32(o + 4);
+        live.minis.set(liveKey(cx, cz), new Uint8ClampedArray(buf, o + 8, 1024));
+        got.push([cx, cz]);
+      }
+      await drawLiveOverview(got);
+      for (const [cx, cz] of changed) {
+        const img = live.imgs.get(liveKey(cx, cz));
+        if (img) loadLiveImg(img, cx, cz);
+      }
+      return;
+    }
+  } catch (err) {
+    console.warn('Жива мапа:', err);
+  } finally {
+    live.busy = false;
+    live.polledAt = Date.now();
+    renderLiveBadge();
+  }
+}
+setInterval(() => { if (!document.hidden) pollLive(); }, 60_000);
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && Date.now() - live.polledAt > 60_000) pollLive();
+});
+
+// Огляд здалеку: мініатюри, піксель на блок, як і сама мапа міста. Мапа поділена на квадрати 32×32 чанки,
+// тож далекі області не роздувають одну картинку, а перемальовується лише квадрат, де щось змінилося.
+async function drawLiveOverview(chunks) {
+  const gen = live.gen;
+  const blocks = new Set(chunks.map(([cx, cz]) => Math.floor(cx / OV) + ',' + Math.floor(cz / OV)));
+  for (const bk of blocks) {
+    const [bx, bz] = bk.split(',').map(Number);
+    const c = document.createElement('canvas');
+    c.width = c.height = OV * 16;
+    const g = c.getContext('2d');
+    const img = g.createImageData(16, 16);
+    for (let j = 0; j < OV; j++) {
+      for (let i = 0; i < OV; i++) {
+        const px = live.minis.get(liveKey(bx * OV + i, bz * OV + j));
+        if (!px) continue;
+        img.data.set(px);
+        g.putImageData(img, i * 16, j * 16);
+      }
+    }
+    const blob = await new Promise((resolve) => c.toBlob(resolve));
+    if (!blob || gen !== live.gen) return;
+    const url = URL.createObjectURL(blob);
+    const old = live.blocks.get(bk);
+    if (old) {
+      old.overlay.setUrl(url);
+      URL.revokeObjectURL(old.url);
+      old.url = url;
+    } else {
+      const bounds = L.latLngBounds(toLatLng(bx * OV * 16, bz * OV * 16), toLatLng((bx + 1) * OV * 16, (bz + 1) * OV * 16));
+      live.blocks.set(bk, { overlay: L.imageOverlay(url, bounds, { className: 'live-overview' }).addTo(map), url });
+    }
+  }
+  grid.bringToFront();
+}
+
+function ago(ms) {
+  const s = (Date.now() - ms) / 1000;
+  if (s < 90) return 'щойно';
+  if (s < 3600) return `${Math.round(s / 60)} хв тому`;
+  if (s < 86400) return `${Math.round(s / 3600)} год тому`;
+  return new Date(ms).toLocaleDateString('uk-UA');
+}
+function liveLatest() {
+  let best = null;
+  for (const t of live.tiles.values()) if (!best || t.at > best.at) best = t;
+  return best;
+}
+function renderLiveBadge() {
+  const btn = $('#liveBtn');
+  const latest = liveLatest();
+  btn.classList.toggle('on', !!latest && Date.now() - latest.at < 15 * 60_000);
+  btn.innerHTML = '<span class="live-dot" aria-hidden="true"></span>Жива мапа'
+    + (live.tiles.size ? ` <span class="count">${live.tiles.size}</span>` : '');
+  btn.title = latest ? `Оновлено ${ago(latest.at)}${latest.player ? ', ' + latest.player : ''}` : 'Мод, який сам оновлює мапу з гри';
+  if ($('#liveDialog').open) renderLiveStatus();
+}
+
+// --- Вікно «Жива мапа» ---
+const plural = (one, few, many) => (n) => {
+  const d = n % 10, h = n % 100;
+  if (d === 1 && h !== 11) return one;
+  return d >= 2 && d <= 4 && (h < 12 || h > 14) ? few : many;
+};
+const chunksWord = plural('чанк', 'чанки', 'чанків');
+const areasWord = plural('область', 'області', 'областей');
+const blocksWord = plural('блок', 'блоки', 'блоків');
+function renderLiveStatus() {
+  const el = $('#liveStatus');
+  const layer = currentLayer();
+  const anyLive = state.layers.some((l) => l.live);
+  if (layer?.live && live.layerId === layer.id) {
+    const latest = liveLatest();
+    const n = layer.liveAreas?.length || 0;
+    const areas = n ? ` Мод оновлює ще ${n} ${areasWord(n)} поза мапою або з іншим зрізом.` : '';
+    el.innerHTML = (latest
+      ? `Шар «${esc(layer.name)}»: <b>${live.tiles.size} ${chunksWord(live.tiles.size)}</b> з гри, востаннє ${ago(latest.at)}${latest.player ? ` (${esc(latest.player)})` : ''}.`
+      : `Шар «${esc(layer.name)}» чекає на перші чанки з гри. Зріз: Y від ${layer.live.top} до ${layer.live.bottom}.`) + areas;
+  } else if (anyLive) {
+    el.textContent = 'На цьому шарі жива мапа вимкнена. Вибери шар, де вона ввімкнена.';
+  } else {
+    el.textContent = 'Жива мапа ще не ввімкнена. Її вмикає редактор нижче в цьому вікні.';
+  }
+}
+
+function renderLiveLayers() {
+  const box = $('#liveLayers');
+  if (!state.layers.length) { box.innerHTML = '<p class="live-note">Спершу додай шар мапи.</p>'; return; }
+  box.innerHTML = state.layers.map((l) => {
+    const top = l.live?.top ?? l.model?.sliceTop ?? '';
+    const bottom = l.live?.bottom ?? l.model?.sliceBottom ?? '';
+    return `<div class="live-layer" data-id="${esc(l.id)}">
+      <label class="check"><input type="checkbox" data-on ${l.live ? 'checked' : ''}> ${esc(l.name)} <span class="muted">· ${DIM_NAMES[l.dimension]}</span></label>
+      <label>Зріз згори, Y<input type="number" step="1" data-top value="${esc(top)}"></label>
+      <label>знизу, Y<input type="number" step="1" data-bottom value="${esc(bottom)}"></label>
+      <button type="button" class="btn" data-save>Зберегти</button>
+      <button type="button" class="btn danger" data-clear ${l.live ? '' : 'disabled'}>Стерти чанки</button>
+      <p class="live-msg" data-msg></p>
+      ${l.live ? renderAreaList(l) : ''}
+    </div>`;
+  }).join('');
+}
+const areaName = (l, a) => a.name || `Область ${(l.liveAreas || []).indexOf(a) + 1}`;
+function renderAreaList(l) {
+  const areas = l.liveAreas || [];
+  const items = areas.map((a) => `<li data-area="${esc(a.id)}">
+      <span class="live-area-name">${esc(areaName(l, a))}</span>
+      <span class="mono">X ${a.minX}…${a.maxX} · Z ${a.minZ}…${a.maxZ}</span>
+      <span class="mono live-area-y${a.top !== l.live.top || a.bottom !== l.live.bottom ? ' own' : ''}">Y ${a.top}…${a.bottom}</span>
+      <span class="live-area-btns"><button type="button" class="btn" data-area-show>Показати</button><button type="button" class="btn" data-area-edit>Змінити</button></span>
+    </li>`).join('');
+  return `<div class="live-areas">
+    <div class="live-areas-head"><span>Області${areas.length ? ` · ${areas.length}` : ''}</span><button type="button" class="btn" data-area-add>+ Область</button></div>
+    ${areas.length ? `<ul>${items}</ul>`
+      : '<p class="live-note">Поки мод оновлює лише сам шар і 32 блоки навколо. Намалюй область на мапі, щоб розширити територію або показати частину міста нижче чи вище.</p>'}
+  </div>`;
+}
+
+async function renderLiveKey(created) {
+  const box = $('#liveKeyBox');
+  if (created) {
+    const cmd = `/citymap key ${created}`;
+    box.innerHTML = `<p>Новий ключ. Скопіюй команду й передай гравцям із модом: потім ключ більше не показується.</p>
+      <div class="row"><input readonly value="${esc(cmd)}" aria-label="Команда з ключем"><button type="button" class="btn primary" data-copy>Копіювати</button></div>`;
+    $('[data-copy]', box).addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(cmd); toast('Команду скопійовано'); }
+      catch { $('input', box).select(); toast('Виділи й скопіюй команду вручну'); }
+    });
+    return;
+  }
+  box.innerHTML = '<p class="live-note">Перевіряю ключ…</p>';
+  try {
+    const k = await api('live/key');
+    box.innerHTML = k.exists
+      ? `<p>Ключ для мода створено ${new Date(k.createdAt).toLocaleDateString('uk-UA')}. Його видно лише один раз, тож якщо він загубився, створи новий: старий перестане працювати.</p>
+         <div class="row"><button type="button" class="btn" data-newkey>Створити новий ключ</button></div>`
+      : `<p>Ключа ще немає. Створи його й дай гравцям, у яких стоїть мод: без ключа мод нічого не надсилає.</p>
+         <div class="row"><button type="button" class="btn primary" data-newkey>Створити ключ</button></div>`;
+    $('[data-newkey]', box).addEventListener('click', async (e) => {
+      if (k.exists && !confirm('Створити новий ключ? Старий перестане працювати, і гравцям доведеться ввести новий.')) return;
+      e.target.disabled = true;
+      try { renderLiveKey((await api('live/key', { method: 'POST' })).key); }
+      catch (err) { toast(err.message); e.target.disabled = false; }
+    });
+  } catch (err) {
+    box.innerHTML = `<p class="error">${esc(err.message)}</p>`;
+  }
+}
+
+$('#liveBtn').addEventListener('click', () => {
+  renderLiveStatus();
+  if (isEditor()) { renderLiveKey(); renderLiveLayers(); }
+  openDialog('#liveDialog');
+});
+$('#liveLayers').addEventListener('click', async (e) => {
+  const row = e.target.closest('.live-layer');
+  const btn = e.target.closest('button');
+  if (!row || !btn) return;
+  const id = row.dataset.id;
+  const layer = state.layers.find((l) => l.id === id);
+  if (btn.matches('[data-area-add]')) { if (layer) startAreaDraw(layer); return; }
+  const li = btn.closest('[data-area]');
+  if (li) {
+    const area = layer?.liveAreas?.find((a) => a.id === li.dataset.area);
+    if (!area) return;
+    if (btn.matches('[data-area-edit]')) openArea(layer, area);
+    if (btn.matches('[data-area-show]')) {
+      $('#liveDialog').close();
+      useLayer(layer);
+      map.fitBounds(areaBounds(area), { maxZoom: 3, padding: [40, 40] });
+      flashArea(area.id);
+    }
+    return;
+  }
+  const msg = $('[data-msg]', row);
+  msg.textContent = '';
+  msg.classList.remove('bad');
+  btn.disabled = true;
+  let done = '';
+  try {
+    if (btn.matches('[data-save]')) {
+      const enabled = $('[data-on]', row).checked;
+      const top = $('[data-top]', row).value, bottom = $('[data-bottom]', row).value;
+      if (enabled && (top === '' || bottom === '')) throw new Error('Вкажи зріз згори і знизу');
+      await api('live/' + encodeURIComponent(id), { method: 'PATCH', json: { enabled, top: Number(top), bottom: Number(bottom) } });
+      done = enabled ? 'Збережено: жива мапа ввімкнена.' : 'Живу мапу на цьому шарі вимкнено.';
+    } else if (btn.matches('[data-clear]')) {
+      if (!confirm('Стерти всі чанки з гри на цьому шарі? Мод намалює їх знову, коли гравці там пройдуть.')) return;
+      await api('live/' + encodeURIComponent(id), { method: 'DELETE' });
+      done = 'Чанки стерто.';
+    }
+    await loadLayers();
+    live.layerId = null; // перечитати шар із новими налаштуваннями
+    renderCityMap();
+    renderLiveLayers();
+    renderLiveStatus();
+    const fresh = $(`.live-layer[data-id="${CSS.escape(id)}"] [data-msg]`);
+    if (fresh) fresh.textContent = done;
+  } catch (err) {
+    msg.textContent = err.message;
+    msg.classList.add('bad');
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// --- Області живої мапи: прямокутники, які мод оновлює теж, кожен може мати свій зріз ---
+map.createPane('areasPane').style.zIndex = 450; // над мапою й чанками, під мітками
+const areaRenderer = L.svg({ pane: 'areasPane' });
+const areaShapes = L.layerGroup().addTo(map);
+const AREA_STYLE = {
+  pane: 'areasPane', renderer: areaRenderer, color: '#22e1e3', weight: 2, dashArray: '6 5',
+  fillColor: '#22e1e3', fillOpacity: 0.05,
+};
+const areaBounds = (a) => L.latLngBounds(toLatLng(a.minX, a.minZ), toLatLng(a.maxX + 1, a.maxZ + 1));
+// Межі рівняються до чанків, як і на сервері.
+function snapArea(x0, z0, x1, z1) {
+  const lo = (v) => Math.floor(v / 16) * 16, hi = (v) => Math.floor(v / 16) * 16 + 15;
+  return { minX: lo(Math.min(x0, x1)), maxX: hi(Math.max(x0, x1)), minZ: lo(Math.min(z0, z1)), maxZ: hi(Math.max(z0, z1)) };
+}
+
+// Обриси видно лише редактору: гостям досить самих чанків. Клікається лише ярлик у кутку,
+// щоб клік усередині області лишався звичайним кліком по мапі.
+function renderAreas() {
+  areaShapes.clearLayers();
+  const layer = v3d.mode === '3d' ? null : currentLayer();
+  if (!layer?.live || !isEditor()) return;
+  for (const a of layer.liveAreas || []) {
+    const own = a.top !== layer.live.top || a.bottom !== layer.live.bottom;
+    const rect = L.rectangle(areaBounds(a), { ...AREA_STYLE, interactive: false, className: 'live-area' + (own ? ' own' : '') });
+    rect.areaId = a.id;
+    rect.addTo(areaShapes);
+    const icon = L.divIcon({
+      className: '', iconSize: null, iconAnchor: [0, 0],
+      html: `<span class="area-tag${own ? ' own' : ''}" title="Змінити область">${esc(areaName(layer, a))} <span class="mono">Y ${a.top}…${a.bottom}</span></span>`,
+    });
+    L.marker(toLatLng(a.minX, a.minZ), { icon, zIndexOffset: -200, title: areaName(layer, a) })
+      .on('click', () => { if (!draw.layer && !placing) openArea(layer, a); })
+      .addTo(areaShapes);
+  }
+}
+function flashArea(id) {
+  areaShapes.eachLayer((r) => {
+    if (r.areaId !== id) return;
+    const el = r.getElement();
+    el?.classList.remove('flash');
+    void el?.getBoundingClientRect();
+    el?.classList.add('flash');
+  });
+}
+function useLayer(layer) {
+  if (v3d.mode === '3d') setMode('2d');
+  if (state.dim !== layer.dimension) {
+    state.layerId = layer.id;
+    store.set('layerId', layer.id);
+    setDimension(layer.dimension);
+  } else if (currentLayer()?.id !== layer.id) {
+    state.layerId = layer.id;
+    store.set('layerId', layer.id);
+    renderCityMap();
+  }
+}
+
+// Малювання: два кліки по протилежних кутах. Так само працює і пальцем на телефоні.
+const draw = { layer: null, a: null, rect: null };
+function areaHint(text) {
+  $('#areaHint [data-text]').textContent = text;
+  $('#areaHint').hidden = false;
+}
+function startAreaDraw(layer) {
+  $('#liveDialog').close();
+  useLayer(layer);
+  setPlacing(false);
+  stopAreaDraw();
+  draw.layer = layer;
+  map.getContainer().classList.add('placing');
+  areaHint('Клацни на мапі перший кут області.');
+}
+function stopAreaDraw() {
+  if (!draw.layer) return;
+  draw.layer = null;
+  draw.a = null;
+  draw.rect?.remove();
+  draw.rect = null;
+  map.getContainer().classList.remove('placing');
+  $('#areaHint').hidden = true;
+}
+$('#areaCancel').addEventListener('click', stopAreaDraw);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && draw.layer) stopAreaDraw(); });
+const blockAt = (latlng) => [Math.floor(latlng.lng), Math.floor(-latlng.lat)];
+map.on('click', (e) => {
+  if (!draw.layer) return;
+  const [x, z] = blockAt(e.latlng);
+  if (!draw.a) {
+    draw.a = [x, z];
+    draw.rect = L.rectangle(areaBounds(snapArea(x, z, x, z)), { ...AREA_STYLE, interactive: false, className: 'live-area drawing' })
+      .addTo(map);
+    areaHint('Тепер клацни протилежний кут.');
+    return;
+  }
+  const layer = draw.layer;
+  const b = snapArea(draw.a[0], draw.a[1], x, z);
+  stopAreaDraw();
+  openArea(layer, null, b);
+});
+map.on('mousemove', (e) => {
+  if (!draw.a || !draw.rect) return;
+  const [x, z] = blockAt(e.latlng);
+  draw.rect.setBounds(areaBounds(snapArea(draw.a[0], draw.a[1], x, z)));
+});
+
+const AREA_FIELDS = ['name', 'minX', 'maxX', 'minZ', 'maxZ', 'top', 'bottom'];
+function openArea(layer, area, bounds) {
+  const f = $('#areaForm');
+  f.reset();
+  f.dataset.layer = layer.id;
+  f.dataset.id = area?.id || '';
+  const v = area || { ...bounds, name: '', top: layer.live?.top ?? '', bottom: layer.live?.bottom ?? '' };
+  for (const k of AREA_FIELDS) f.elements[k].value = v[k] ?? '';
+  $('[data-title]', f).textContent = area ? areaName(layer, area) : 'Нова область';
+  $('[data-delete]', f).hidden = !area;
+  renderAreaSize();
+  openDialog('#areaDialog');
+}
+function renderAreaSize() {
+  const f = $('#areaForm');
+  const layer = state.layers.find((l) => l.id === f.dataset.layer);
+  const n = (k) => (f.elements[k].value.trim() === '' ? NaN : Number(f.elements[k].value));
+  const parts = [];
+  if (['minX', 'maxX', 'minZ', 'maxZ'].every((k) => Number.isFinite(n(k)))) {
+    const b = snapArea(n('minX'), n('minZ'), n('maxX'), n('maxZ'));
+    const w = b.maxX - b.minX + 1, h = b.maxZ - b.minZ + 1, chunks = (w / 16) * (h / 16);
+    parts.push(`${w} × ${h} ${blocksWord(h)}, ${chunks} ${chunksWord(chunks)}.`);
+  }
+  if (layer?.live) {
+    parts.push(`Основний зріз шару: Y ${layer.live.top}…${layer.live.bottom}. Щоб показати поверх нижче чи вище, зміни зріз тут.`);
+  }
+  $('[data-size]', f).textContent = parts.join(' ');
+}
+$('#areaForm').addEventListener('input', renderAreaSize);
+async function afterAreaChange(layerId, r, saved) {
+  await loadLayers();
+  if (r.erased) live.layerId = null; // чанки стерлися: перечитуємо живий шар з нуля
+  renderCityMap();
+  const text = saved + (r.erased ? ` Стерто старих чанків: ${r.erased}, мод намалює їх заново.` : '');
+  if ($('#liveDialog').open) {
+    // Тост сховався б під вікном, тож пишемо в рядок шару.
+    renderLiveLayers();
+    const msg = $(`.live-layer[data-id="${CSS.escape(layerId)}"] [data-msg]`);
+    if (msg) msg.textContent = text;
+  } else {
+    toast(text);
+  }
+}
+$('#areaForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const f = e.target;
+  withBusy(f, async () => {
+    const id = f.dataset.id;
+    const json = Object.fromEntries(AREA_FIELDS.map((k) => [k, f.elements[k].value]));
+    const r = await api(`live/${encodeURIComponent(f.dataset.layer)}/areas${id ? '/' + encodeURIComponent(id) : ''}`,
+      { method: id ? 'PUT' : 'POST', json });
+    f.closest('dialog').close();
+    await afterAreaChange(f.dataset.layer, r, id ? 'Область збережено.' : 'Область додано: мод оновлюватиме її, коли гравці там ходять.');
+    if (r.area) flashArea(r.area.id);
+  });
+});
+$('#areaForm [data-delete]').addEventListener('click', async (e) => {
+  const f = $('#areaForm');
+  if (!confirm('Видалити область? Чанки, які мод малював лише для неї, зітруться.')) return;
+  e.target.disabled = true;
+  try {
+    const r = await api(`live/${encodeURIComponent(f.dataset.layer)}/areas/${encodeURIComponent(f.dataset.id)}`, { method: 'DELETE' });
+    f.closest('dialog').close();
+    await afterAreaChange(f.dataset.layer, r, 'Область видалено.');
+  } catch (err) {
+    showError(f, err.message);
+  } finally {
+    e.target.disabled = false;
+  }
+});
+
 function setDimension(dim) {
   state.dim = dim;
   $('#dimSelect').value = dim;
@@ -504,6 +1013,7 @@ function setMode(mode) {
   $('#view-map').classList.toggle('mode-3d', mode === '3d');
   store.set('mapMode', mode);
   if (mode === '3d') show3d();
+  syncLive();
 }
 $$('#modeSeg button').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
 

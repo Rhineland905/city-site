@@ -13,6 +13,7 @@
   --soul-glow: 0 0 14px rgba(34, 225, 227, .45);
   --on-soul: #021214;
   --danger: #ff6f61;
+  --amethyst: #c07bff;      /* області з власним зрізом */
   --todo: #4f8e98;
   --doing: #22e1e3;
   --done: #7fe8b0;
@@ -503,4 +504,72 @@ fieldset:disabled { opacity: .45; }
   .markers-panel { top: 12px; max-height: calc(100% - 150px); }
   .place-hint { top: 12px; white-space: normal; width: calc(100% - 24px); justify-content: space-between; }
   .kind-options { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* Жива мапа: чанки з гри поверх мапи й вікно з модом. */
+.live-btn { display: inline-flex; align-items: center; gap: 7px; }
+.live-dot { flex: none; width: 8px; height: 8px; border-radius: 1px; background: var(--line-2); }
+.live-btn.on .live-dot { background: var(--soul); box-shadow: 0 0 8px var(--soul); animation: heartbeat 1.8s ease-in-out infinite; }
+.live-tiles img { image-rendering: pixelated; }
+.live-soft .live-tiles img { image-rendering: auto; }
+.live-status {
+  padding: 10px 12px; background: var(--panel-2); border: 2px solid var(--line); border-radius: var(--radius);
+}
+.live-status b { color: var(--soul); font-weight: 600; }
+.live-download { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.live-note { font-size: 13px; color: var(--muted); }
+.form .steps { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 6px; }
+.steps .mono { color: var(--soul); background: var(--void); padding: 1px 5px; border-radius: 2px; overflow-wrap: anywhere; }
+.live-admin { display: flex; flex-direction: column; gap: 12px; border-top: 2px solid var(--line); padding-top: 14px; }
+.live-admin h3 { margin: 0; font-family: var(--pixel); font-size: 18px; font-weight: 600; }
+.live-key { display: flex; flex-direction: column; gap: 8px; }
+.live-key .row { display: flex; gap: 8px; }
+.live-key input { flex: 1; min-width: 0; font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 13px; color: var(--soul); }
+.live-layers { display: flex; flex-direction: column; gap: 8px; }
+.live-layer {
+  display: grid; grid-template-columns: 1fr 110px 110px auto auto; gap: 8px; align-items: end;
+  padding: 10px; background: var(--panel-2); border: 2px solid var(--line); border-radius: var(--radius);
+}
+.form .live-layer .check { flex-direction: row; margin: 0 0 10px; color: var(--text); font-size: 14px; }
+.live-msg { grid-column: 1 / -1; font-size: 13px; color: var(--soul); }
+.live-msg:empty { display: none; }
+.live-msg.bad { color: var(--danger); }
+@media (max-width: 760px) {
+  .live-layer { grid-template-columns: 1fr 1fr; }
+  .form .live-layer .check { grid-column: 1 / -1; margin: 0; }
+}
+
+/* Області живої мапи: у вікні й обриси на мапі (лише для редактора). */
+.live-areas { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--line); padding-top: 8px; }
+.live-areas-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; font-weight: 500; color: var(--muted); }
+.live-areas-head .btn { padding: 3px 10px; font-size: 13px; }
+.live-areas ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.live-areas li {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 10px; align-items: center;
+  padding: 5px 6px 5px 10px; background: var(--void); border: 1px solid var(--line); border-radius: 2px; font-size: 13px;
+}
+.live-area-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.live-areas .mono { font-size: 12px; color: var(--muted); }
+.live-areas .live-area-y.own { color: var(--amethyst); }
+.live-area-btns { display: flex; gap: 4px; }
+.live-area-btns .btn { padding: 2px 8px; font-size: 12px; }
+.live-area { transition: stroke-width .2s; }
+.live-area.own { stroke: var(--amethyst); fill: var(--amethyst); }
+.live-area.drawing { stroke-dasharray: none; fill-opacity: .14; }
+.live-area.flash { animation: area-flash 1.4s ease-out 2; }
+@keyframes area-flash {
+  0% { stroke-width: 7px; fill-opacity: .3; }
+  100% { stroke-width: 2px; fill-opacity: .05; }
+}
+.area-tag {
+  display: inline-block; margin: 5px 0 0 5px; padding: 1px 6px; white-space: nowrap; cursor: pointer;
+  background: rgba(4, 8, 10, .88); color: var(--soul); border: 1px solid currentColor; border-radius: 2px;
+  font: 13px/1.5 var(--pixel); box-shadow: 0 0 8px rgba(34, 225, 227, .25);
+}
+.area-tag .mono { color: var(--muted); font-size: 11px; }
+.area-tag.own { color: var(--amethyst); box-shadow: 0 0 8px rgba(192, 123, 255, .3); }
+@media (max-width: 760px) {
+  .live-areas li { grid-template-columns: minmax(0, 1fr) auto; }
+  .live-areas li > .mono:not(.live-area-y) { grid-column: 1 / -1; grid-row: 2; }
+  .live-area-btns { grid-column: 1 / -1; }
 }
