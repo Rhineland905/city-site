@@ -110,15 +110,27 @@ function glowTexture() {
   return new THREE.CanvasTexture(c);
 }
 
-export function buildModel(schem, { hideNatural = false, clippingPlanes = [] } = {}) {
+// colors: средние цвета блоков из текстур игры { 'minecraft:grass_block': ['#верх', '#бок'] }.
+// Без них цвета берутся из таблицы в blocks.js.
+export function buildModel(schem, { hideNatural = false, clippingPlanes = [], colors = null } = {}) {
   const { width: W, height: H, length: L, blocks, palette } = schem;
   const WL = W * L;
   const cls = palette.map((n) => classify(n || 'minecraft:air', hideNatural));
   // THREE.Color переводит цвет из sRGB в линейное пространство, иначе всё выглядит выцветшим.
-  const rgb = palette.map((n) => {
-    const c = new THREE.Color().setHex(blockColor(n || 'minecraft:air'));
-    const lift = (v) => Math.min(1, v * 1.3 + 0.02); // тёмный deepslate иначе сливается с фоном
+  const lift = (v) => Math.min(1, v * 1.3 + 0.02); // тёмный deepslate иначе сливается с фоном
+  const toRgb = (hex) => {
+    const c = new THREE.Color().setHex(hex);
     return [lift(c.r), lift(c.g), lift(c.b)];
+  };
+  const rgbTop = [], rgbSide = [];
+  palette.forEach((n, i) => {
+    const pair = colors && colors[n];
+    if (pair) {
+      rgbTop[i] = toRgb(parseInt(pair[0].slice(1), 16));
+      rgbSide[i] = toRgb(parseInt(pair[1].slice(1), 16));
+    } else {
+      rgbTop[i] = rgbSide[i] = toRgb(blockColor(n || 'minecraft:air'));
+    }
   });
   const lights = palette.map((n) => new THREE.Color(lightColor(n || '')));
   const occludes = cls.map((c) => c.k === K.full || c.k === K.emissive);
@@ -136,7 +148,6 @@ export function buildModel(schem, { hideNatural = false, clippingPlanes = [] } =
         const id = blocks[i];
         const c = cls[id];
         if (c.k === K.skip) continue;
-        const [r, g, b] = rgb[id];
         if (c.k === K.full || c.k === K.emissive || c.k === K.translucent) {
           const target = c.k === K.translucent ? glass : solid;
           const k = c.k === K.emissive ? 1.15 : grain(x, y, z);
@@ -149,6 +160,7 @@ export function buildModel(schem, { hideNatural = false, clippingPlanes = [] } =
             }
             if (!draw) continue;
             const s = c.k === K.emissive ? k : f.shade * k;
+            const [r, g, b] = f.n[1] === 1 ? rgbTop[id] : rgbSide[id];
             target.face(f, x + 0.5, y + 0.5, z + 0.5, 0.5, 0.5, 0.5, r * s, g * s, b * s);
             faces++;
           }
@@ -159,6 +171,7 @@ export function buildModel(schem, { hideNatural = false, clippingPlanes = [] } =
           const k = c.k === K.light ? 1.2 : grain(x, y, z);
           for (const f of FACES) {
             const s = c.k === K.light ? k : f.shade * k;
+            const [r, g, b] = f.n[1] === 1 ? rgbTop[id] : rgbSide[id];
             solid.face(f, x + 0.5, cy, z + 0.5, bx / 2, by / 2, bz / 2, r * s, g * s, b * s);
             faces++;
           }
