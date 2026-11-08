@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "citymap-test",
+  "version": "1.0.0",
+  "name": "City Map test",
+  "environment": "client",
+  "entrypoints": {
+    "fabric-client-gametest": ["ua.city.map.CityMapGameTest"]
+  },
+  "depends": {
+    "citymap": "*"
+  }
+}

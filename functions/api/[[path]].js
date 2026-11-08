@@ -25,6 +25,22 @@ function int(v) {
   return Number.isInteger(n) && Math.abs(n) <= 30_000_000 ? n : null;
 }
 
+// Жива мапа: мод у грі малює чанки, які прогрузив гравець, і присилає їх сюди.
+// Кожен чанк зберігається окремо: картинка 256×256 (16 пікселів на блок) і міні 16×16 для огляду здалеку.
+const LIVE_SCHEMA = `CREATE TABLE IF NOT EXISTS live_tiles (
+    layer TEXT NOT NULL, cx INTEGER NOT NULL, cz INTEGER NOT NULL,
+    hash TEXT NOT NULL, png BLOB NOT NULL, mini BLOB NOT NULL,
+    player TEXT DEFAULT '', updated_at INTEGER NOT NULL,
+    PRIMARY KEY (layer, cx, cz))`;
+const LIVE_MAX_TILES = 24; // за один запит: на безкоштовному плані D1 дозволяє 50 запитів на виклик
+const LIVE_MAX_PNG = 400 * 1024;
+const LIVE_MAX_BODY = 8 * 1024 * 1024;
+const LIVE_MARGIN = 32; // скільки блоків навколо шару мод теж може малювати
+const LIVE_MAX_AREAS = 32;
+// Усі області шару разом: чанк важить десятки КБ, а база D1 на безкоштовному плані вміщує 500 МБ.
+const LIVE_AREA_CHUNKS = 4096;
+const MINI_BYTES = 16 * 16 * 4;
+
 // Таблицы создаются сами при первом запросе, вручную ничего выполнять не нужно.
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS schematics (
@@ -47,6 +63,8 @@ const SCHEMA = [
     author TEXT DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  LIVE_SCHEMA,
+  'CREATE INDEX IF NOT EXISTS live_tiles_updated ON live_tiles (layer, updated_at)',
 ];
 // Типи міток. Підписи й значки задає сайт (app.js), тут лише список дозволених.
 const MARKER_KINDS = ['home', 'farm', 'storage', 'mine', 'portal', 'shop', 'danger', 'other'];
@@ -114,11 +132,33 @@ function ensureSchema(env) {
         await saveLayers(env, layers.map((l) => (guessed(l) ? { ...l, originX: 4094, originZ: 1398 } : l)));
       }
     }
+    // Жива мапа: один раз вмикаємо її для шару міста зі зрізом, з якого намальована мапа.
+    const liveOn = await env.DB.prepare(
+      "INSERT INTO settings (key, value) VALUES ('live_default', '1') ON CONFLICT(key) DO NOTHING"
+    ).run();
+    if (liveOn.meta.changes === 1) {
+      const layers = await getLayers(env);
+      const slice = (l) => {
+        if (l.live !== undefined) return null;
+        if (Number.isInteger(l.model?.sliceTop) && Number.isInteger(l.model?.sliceBottom)) {
+          return { top: l.model.sliceTop, bottom: l.model.sliceBottom };
+        }
+        // Мапу міста малювали ще до того, як зріз почав зберігатися: −37…−53 підказав сам сайт.
+        if (l.originX === 4094 && l.originZ === 1398 && l.model) return { top: -37, bottom: -53 };
+        return null;
+      };
+      if (layers.some(slice)) {
+        await saveLayers(env, layers.map((l) => {
+          const s = slice(l);
+          return s ? { ...l, live: { ...s, epoch: Date.now() } } : l;
+        }));
+      }
+    }
   })().catch((e) => { schemaReady = null; throw e; });
   return schemaReady;
 }
 
-export async function onRequest({ request, env, params }) {
+export async function onRequest({ request, env, params, waitUntil }) {
   const parts = params.path || [];
   const method = request.method;
   const [section, id, action] = parts;
@@ -136,6 +176,7 @@ export async function onRequest({ request, env, params }) {
     if (section === 'tasks') return await tasks(request, env, method, id);
     if (section === 'map') return await map(request, env, method, id, action);
     if (section === 'markers') return await markers(request, env, method, id);
+    if (section === 'live') return await live(request, env, method, parts, waitUntil);
     if (section === 'colors' && method === 'GET') return json(await getColors(env));
     return fail(404, 'Не знайдено');
   } catch (e) {
@@ -428,6 +469,8 @@ async function map(request, env, method, id, action) {
       name, dimension, originX, originZ, scale, width, height,
       version: hasFile ? Date.now() : existing.version,
       model: modelInfo,
+      live: existing?.live || null, // налаштування живої мапи не губляться, коли шар перемальовують
+      liveAreas: existing?.liveAreas || [],
     };
     if (hasFile) {
       await env.FILES.put(`map:${layer.id}`, await file.arrayBuffer(), { metadata: { type: file.type } });
@@ -445,7 +488,275 @@ async function map(request, env, method, id, action) {
     if (!layers.some((l) => l.id === id)) return fail(404, 'Шар не знайдено');
     await env.FILES.delete(`map:${id}`);
     await env.FILES.delete(`model:${id}`);
+    await env.DB.prepare('DELETE FROM live_tiles WHERE layer = ?').bind(id).run();
     await saveLayers(env, layers.filter((l) => l.id !== id));
+    return json({ ok: true });
+  }
+  return fail(405, 'Метод не підтримується');
+}
+
+// ---------- Жива мапа ----------
+// Де мод малює чанки: прямокутник шару з невеликим запасом і області, які додав редактор.
+// Область рівняється до меж чанків і може мати свій зріз за висотою, нижче чи вище за основний.
+const layerBox = (l) => ({
+  minX: l.originX - LIVE_MARGIN, minZ: l.originZ - LIVE_MARGIN,
+  maxX: Math.ceil(l.originX + l.width * l.scale) + LIVE_MARGIN - 1,
+  maxZ: Math.ceil(l.originZ + l.height * l.scale) + LIVE_MARGIN - 1,
+});
+function liveLayers(layers) {
+  return layers.filter((l) => l.live).map((l) => ({
+    id: l.id, name: l.name, dimension: l.dimension, top: l.live.top, bottom: l.live.bottom, epoch: l.live.epoch || 0,
+    ...layerBox(l),
+    areas: (l.liveAreas || []).map(({ minX, minZ, maxX, maxZ, top, bottom }) => ({ minX, minZ, maxX, maxZ, top, bottom })),
+  }));
+}
+// Межі в чанках, включно: чанк рахується, якщо зачіпає прямокутник хоч краєм.
+const chunkBox = (r) => ({
+  c0: Math.floor(r.minX / 16), c1: Math.floor(r.maxX / 16), r0: Math.floor(r.minZ / 16), r1: Math.floor(r.maxZ / 16),
+});
+const inBox = (b, cx, cz) => cx >= b.c0 && cx <= b.c1 && cz >= b.r0 && cz <= b.r1;
+const boxesOverlap = (a, b) => a.c0 <= b.c1 && b.c0 <= a.c1 && a.r0 <= b.r1 && b.r0 <= a.r1;
+// Числа вже перевірені, тож їх можна вписати в SQL прямо: D1 приймає не більше 100 параметрів.
+const boxSql = (b) => `(cx BETWEEN ${b.c0} AND ${b.c1} AND cz BETWEEN ${b.r0} AND ${b.r1})`;
+const areaChunks = (areas) => areas.reduce((n, a) => {
+  const b = chunkBox(a);
+  return n + (b.c1 - b.c0 + 1) * (b.r1 - b.r0 + 1);
+}, 0);
+const sliceKey = (x) => `${x.top}:${x.bottom}`;
+
+function readArea(body, old) {
+  const read = (v) => (v === null || v === undefined || String(v).trim() === '' ? null : int(v));
+  const v = ['minX', 'maxX', 'minZ', 'maxZ', 'top', 'bottom'].map((k) => read(body[k]));
+  if (v.some((n) => n === null)) return { error: 'Вкажи межі області й зріз цілими числами' };
+  let [x0, x1, z0, z1, top, bottom] = v;
+  if (x0 > x1) [x0, x1] = [x1, x0];
+  if (z0 > z1) [z0, z1] = [z1, z0];
+  if (top < bottom) return { error: 'Зріз згори має бути не нижче за зріз знизу' };
+  if (top > 2048 || bottom < -2048) return { error: 'Зріз за межами світу' };
+  return {
+    area: {
+      id: old?.id || crypto.randomUUID().slice(0, 8),
+      name: str(body.name, 60),
+      // Мод малює цілими чанками, тож і межі рівняємо до чанків.
+      minX: Math.floor(x0 / 16) * 16, maxX: Math.floor(x1 / 16) * 16 + 15,
+      minZ: Math.floor(z0 / 16) * 16, maxZ: Math.floor(z1 / 16) * 16 + 15,
+      top, bottom,
+    },
+  };
+}
+const toHex = (bytes) => [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+async function sha256(text) {
+  return toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))));
+}
+// Мод показує ключ, а не пароль редактора: ключ уміє лише надсилати чанки, і його легко замінити.
+async function liveKeyOk(request, env) {
+  if (authorized(request, env)) return true;
+  const key = request.headers.get('x-live-key');
+  if (!key || key.length > 200) return false;
+  const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'live_key'").first();
+  return !!row && JSON.parse(row.value).hash === (await sha256(key));
+}
+
+// Формат від мода (big-endian): "CMT1", u16 кількість, далі для кожного чанка:
+// i32 cx, i32 cz, 16 байт хешу, 1024 байти міні (16×16 RGBA), u32 довжина PNG, PNG 256×256.
+function parseLiveTiles(buf) {
+  const dv = new DataView(buf);
+  const bytes = new Uint8Array(buf);
+  if (buf.byteLength < 6 || String.fromCharCode(...bytes.subarray(0, 4)) !== 'CMT1') throw new Error('Невідомий формат');
+  const count = dv.getUint16(4);
+  if (count > LIVE_MAX_TILES) throw new Error(`Не більше ${LIVE_MAX_TILES} чанків за раз`);
+  const tiles = [];
+  let o = 6;
+  for (let i = 0; i < count; i++) {
+    if (o + 8 + 16 + MINI_BYTES + 4 > buf.byteLength) throw new Error('Обрізаний запит');
+    const cx = dv.getInt32(o), cz = dv.getInt32(o + 4);
+    const hash = toHex(bytes.subarray(o + 8, o + 24));
+    const mini = buf.slice(o + 24, o + 24 + MINI_BYTES);
+    o += 24 + MINI_BYTES;
+    const n = dv.getUint32(o);
+    o += 4;
+    if (n > LIVE_MAX_PNG || o + n > buf.byteLength) throw new Error('Завелика картинка чанка');
+    const png = bytes.subarray(o, o + n);
+    const sig = [137, 80, 78, 71, 13, 10, 26, 10];
+    const pv = new DataView(buf, o, n);
+    if (n < 24 || sig.some((b, k) => png[k] !== b) || pv.getUint32(16) !== 256 || pv.getUint32(20) !== 256) {
+      throw new Error('Картинка чанка має бути PNG 256×256');
+    }
+    tiles.push({ cx, cz, hash, mini, png: buf.slice(o, o + n) });
+    o += n;
+  }
+  return tiles;
+}
+
+async function live(request, env, method, parts, waitUntil) {
+  const [, id, action, a, b] = parts;
+  if (!id && method === 'GET') return json({ layers: liveLayers(await getLayers(env)) });
+
+  if (id === 'key') {
+    if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
+    const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'live_key'").first();
+    if (method === 'GET') return json({ exists: !!row, createdAt: row ? JSON.parse(row.value).createdAt : null });
+    if (method === 'POST') {
+      const raw = crypto.getRandomValues(new Uint8Array(18));
+      const key = btoa(String.fromCharCode(...raw)).replace(/\+/g, '-').replace(/\//g, '_');
+      const value = JSON.stringify({ hash: await sha256(key), createdAt: Date.now() });
+      await env.DB.prepare(
+        "INSERT INTO settings (key, value) VALUES ('live_key', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      ).bind(value).run();
+      return json({ key });
+    }
+    return fail(405, 'Метод не підтримується');
+  }
+
+  const layers = await getLayers(env);
+  const layer = layers.find((l) => l.id === id);
+  if (!layer) return fail(404, 'Шар не знайдено');
+
+  // Список чанків шару. ?since=час віддає лише ті, що змінилися відтоді (так сайт і мод питають щохвилини).
+  const since = Math.max(0, Number(new URL(request.url).searchParams.get('since')) || 0);
+  if (method === 'GET' && !action) {
+    const { results } = await env.DB.prepare(
+      'SELECT cx, cz, hash, updated_at, player FROM live_tiles WHERE layer = ? AND updated_at >= ?'
+    ).bind(id, since).all();
+    return new Response(JSON.stringify({
+      live: layer.live || null,
+      tiles: results.map((r) => [r.cx, r.cz, r.hash, r.updated_at, r.player]),
+    }), { headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+  }
+
+  // Міні всіх чанків одним шматком: i32 cx, i32 cz і 1024 байти RGBA на кожен.
+  if (method === 'GET' && action === 'minis') {
+    const { results } = await env.DB.prepare('SELECT cx, cz, mini FROM live_tiles WHERE layer = ? AND updated_at >= ?')
+      .bind(id, since).all();
+    const size = 8 + MINI_BYTES;
+    const out = new Uint8Array(results.length * size);
+    const dv = new DataView(out.buffer);
+    results.forEach((r, i) => {
+      dv.setInt32(i * size, r.cx);
+      dv.setInt32(i * size + 4, r.cz);
+      out.set(new Uint8Array(r.mini).subarray(0, MINI_BYTES), i * size + 8);
+    });
+    return new Response(out, { headers: { 'content-type': 'application/octet-stream', 'cache-control': 'no-store' } });
+  }
+
+  if (method === 'GET' && action === 'tile') {
+    const cx = int(a), cz = int(b);
+    if (cx === null || cz === null) return fail(404, 'Чанк не знайдено');
+    const want = new URL(request.url).searchParams.get('h');
+    const cache = want && typeof caches !== 'undefined' ? caches.default : null;
+    const hit = cache && (await cache.match(request).catch(() => null));
+    if (hit) return hit;
+    const row = await env.DB.prepare('SELECT png, hash FROM live_tiles WHERE layer = ? AND cx = ? AND cz = ?')
+      .bind(id, cx, cz).first();
+    if (!row) return fail(404, 'Чанк не знайдено');
+    const fresh = want === row.hash; // в адресі хеш, тож таку картинку можна кешувати назавжди
+    const res = new Response(new Uint8Array(row.png), {
+      headers: {
+        'content-type': 'image/png',
+        'cache-control': fresh ? 'public, max-age=31536000, immutable' : 'public, max-age=60',
+      },
+    });
+    if (fresh && cache && waitUntil) waitUntil(cache.put(request, res.clone()).catch(() => {}));
+    return res;
+  }
+
+  if (method === 'POST' && !action) {
+    if (!(await liveKeyOk(request, env))) return fail(401, 'Ключ мода не підходить');
+    if (!layer.live) return fail(409, 'Для цього шару жива мапа вимкнена');
+    if (Number(request.headers.get('content-length') || 0) > LIVE_MAX_BODY) return fail(413, 'Завеликий запит');
+    const buf = await request.arrayBuffer();
+    if (buf.byteLength > LIVE_MAX_BODY) return fail(413, 'Завеликий запит');
+    let tiles;
+    try { tiles = parseLiveTiles(buf); } catch (e) { return fail(400, e.message); }
+    const [box] = liveLayers([layer]);
+    const boxes = [box, ...box.areas].map(chunkBox);
+    const ok = tiles.filter((t) => boxes.some((b) => inBox(b, t.cx, t.cz)));
+    const player = str(request.headers.get('x-player'), 32).replace(/[^\w.-]/g, '');
+    const now = Date.now();
+    let saved = 0;
+    if (ok.length) {
+      const res = await env.DB.batch(ok.map((t) => env.DB.prepare(
+        `INSERT INTO live_tiles (layer, cx, cz, hash, png, mini, player, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(layer, cx, cz) DO UPDATE SET hash = excluded.hash, png = excluded.png, mini = excluded.mini,
+           player = excluded.player, updated_at = excluded.updated_at
+         WHERE live_tiles.hash <> excluded.hash`
+      ).bind(id, t.cx, t.cz, t.hash, t.png, t.mini, player, now)));
+      saved = res.reduce((n, r) => n + (r.meta?.changes || 0), 0);
+    }
+    return json({ saved, unchanged: ok.length - saved, outside: tiles.length - ok.length });
+  }
+
+  if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
+
+  // Увімкнути живу мапу для шару й задати зріз за висотою.
+  if (method === 'PATCH' && !action) {
+    const body = await request.json().catch(() => ({}));
+    let next = null;
+    if (body.enabled) {
+      const top = int(body.top), bottom = int(body.bottom);
+      if (top === null || bottom === null) return fail(400, 'Вкажи зріз згори і знизу');
+      if (top < bottom) return fail(400, 'Зріз згори має бути не нижче за зріз знизу');
+      if (top > 2048 || bottom < -2048) return fail(400, 'Зріз за межами світу');
+      const old = layer.live;
+      const same = old && old.top === top && old.bottom === bottom;
+      next = { top, bottom, epoch: same ? old.epoch || 0 : Date.now() };
+      // Старі чанки намальовані з іншим зрізом: стираємо їх, мод перемалює.
+      if (!same) await env.DB.prepare('DELETE FROM live_tiles WHERE layer = ?').bind(id).run();
+    }
+    await saveLayers(env, layers.map((l) => (l.id === id ? { ...l, live: next } : l)));
+    return json({ ...layer, live: next });
+  }
+
+  // Області: додають територію, яку оновлює мод, і можуть мати свій зріз.
+  if (action === 'areas') {
+    const areas = layer.liveAreas || [];
+    const old = a ? areas.find((x) => x.id === a) : null;
+    if (a && !old) return fail(404, 'Область не знайдено');
+    let area = null;
+    if ((method === 'POST' && !a) || (method === 'PUT' && a)) {
+      const r = readArea(await request.json().catch(() => ({})), old);
+      if (r.error) return fail(400, r.error);
+      area = r.area;
+      if (!old && areas.length >= LIVE_MAX_AREAS) return fail(400, `Не більше ${LIVE_MAX_AREAS} областей на шарі`);
+    } else if (!(method === 'DELETE' && a)) {
+      return fail(405, 'Метод не підтримується');
+    }
+    const next = !old ? [...areas, area] : area ? areas.map((x) => (x.id === a ? area : x)) : areas.filter((x) => x.id !== a);
+    if (area && areaChunks(next) > LIVE_AREA_CHUNKS) {
+      return fail(400, `Області завеликі: разом до ${LIVE_AREA_CHUNKS} чанків на шарі, це приблизно 1000×1000 блоків`);
+    }
+
+    const geo = (x) => (x ? [x.minX, x.minZ, x.maxX, x.maxZ, x.top, x.bottom].join() : '');
+    const stmts = [];
+    if (geo(old) !== geo(area)) {
+      // Там, де зріз міг змінитися, старі чанки стираємо: мод намалює їх заново.
+      const self = old || area;
+      const boxes = [old, area].filter(Boolean).map(chunkBox);
+      const slices = new Set([old, area].filter(Boolean).map(sliceKey));
+      if (boxes.some((b) => boxesOverlap(b, chunkBox(layerBox(layer))))) slices.add(layer.live ? sliceKey(layer.live) : 'off');
+      for (const x of areas) {
+        if (x.id !== self.id && boxes.some((b) => boxesOverlap(b, chunkBox(x)))) slices.add(sliceKey(x));
+      }
+      if (slices.size > 1) {
+        stmts.push(env.DB.prepare(`DELETE FROM live_tiles WHERE layer = ? AND (${boxes.map(boxSql).join(' OR ')})`).bind(id));
+      }
+      // Чанки, що опинилися поза територією, мод більше не оновить: їх теж прибираємо.
+      const keep = [layerBox(layer), ...next].map(chunkBox);
+      stmts.push(env.DB.prepare(`DELETE FROM live_tiles WHERE layer = ? AND NOT (${keep.map(boxSql).join(' OR ')})`).bind(id));
+    }
+    const erased = stmts.length ? (await env.DB.batch(stmts)).reduce((n, r) => n + (r.meta?.changes || 0), 0) : 0;
+    // Стерті чанки не видно в запитах «що змінилося відтоді», тож нова епоха каже сайту й моду перечитати все.
+    const nextLive = layer.live && erased ? { ...layer.live, epoch: Date.now() } : layer.live;
+    await saveLayers(env, layers.map((l) => (l.id === id ? { ...l, live: nextLive, liveAreas: next } : l)));
+    return json({ areas: next, area, erased });
+  }
+
+  // Стерти всі чанки шару (наприклад, після зміни зрізу).
+  if (method === 'DELETE' && !action) {
+    await env.DB.prepare('DELETE FROM live_tiles WHERE layer = ?').bind(id).run();
+    if (layer.live) {
+      await saveLayers(env, layers.map((l) => (l.id === id ? { ...l, live: { ...l.live, epoch: Date.now() } } : l)));
+    }
     return json({ ok: true });
   }
   return fail(405, 'Метод не підтримується');
