@@ -1216,7 +1216,17 @@ $('#mapForm').addEventListener('submit', (e) => {
 $('#mapForm [data-delete]').addEventListener('click', async () => {
   const form = $('#mapForm');
   const layer = state.layers.find((l) => l.id === form.layerId.value);
-  if (!layer || !confirm(`Видалити шар «${layer.name}»?`)) return;
+  if (!layer) return;
+  const lost = [];
+  if (layer.model) lost.push('3D-модель');
+  if (layer.live) {
+    const n = await api(`live/${encodeURIComponent(layer.id)}?since=0`).then((d) => d.tiles.length).catch(() => 0);
+    if (n) lost.push(`${n} ${chunksWord(n)} з гри`);
+  }
+  const areas = (layer.liveAreas || []).length;
+  if (areas) lost.push(`${areas} ${areasWord(areas)}`);
+  const warn = lost.length ? `\n\nРазом із ним зникнуть ${lost.join(', ')}. Щоб перемалювати мапу, шар не треба видаляти: вибери його в «Мапа зі схематика».` : '';
+  if (!confirm(`Видалити шар «${layer.name}»?${warn}`)) return;
   try {
     await api('map/' + encodeURIComponent(layer.id), { method: 'DELETE' });
     form.closest('dialog').close();
@@ -1280,6 +1290,13 @@ $('#fromSchemForm').file.addEventListener('change', async (e) => {
     fromSchem.file = file;
     info.textContent = `${schem.width}×${schem.height}×${schem.length} блоків (ширина × висота × довжина).`;
     // Зріз: збережений у шарі, інакше від підлоги до верху будинків.
+    let saved = null;
+    try { saved = JSON.parse(store.get('schemCorner:' + file.name) || 'null'); } catch { /* немає */ }
+    if (saved && f.minX.value === '' && f.minZ.value === '') {
+      f.minX.value = saved.minX;
+      f.minY.value = saved.minY;
+      f.minZ.value = saved.minZ;
+    }
     const minY = Number(f.minY.value) || 0;
     const inside = (v) => v !== '' && Number(v) >= minY && Number(v) <= minY + schem.height - 1;
     if (!inside(f.topY.value) || !inside(f.bottomY.value)) {
@@ -1385,6 +1402,8 @@ $('#fromSchemForm').addEventListener('submit', (e) => {
   withBusy(form, async () => {
     if (!fromSchem.schem) throw new Error('Спершу вибери схематик');
     if (Number(form.topY.value) < Number(form.bottomY.value)) throw new Error('Верх зрізу має бути вище за низ');
+    const twin = !form.layerId.value && state.layers.find((l) => l.name === (form.name.value || 'Підземне місто') && l.dimension === form.dimension.value);
+    if (twin && !confirm(`Шар «${twin.name}» уже є. Створити ще один такий самий?\n\nЩоб перемалювати наявний і зберегти його області й чанки з гри, натисни «Скасувати» і вибери його в полі «Шар».`)) return;
     const { width: W, length: L } = fromSchem.schem;
     const tx = fromSchem.tiles ? await loadTextures() : null;
     let px = tx ? tx.pickPx(W, L) : 1;
@@ -1424,6 +1443,7 @@ $('#fromSchemForm').addEventListener('submit', (e) => {
       if (tx) fd.set('colors', JSON.stringify(tx.blockColors(fromSchem.schem, fromSchem.tiles)));
       status.textContent = `Завантажую ${(blob.size / MB).toFixed(1)} МБ…`;
       const layer = await api('map', { method: 'POST', body: fd });
+      store.set('schemCorner:' + fromSchem.file.name, JSON.stringify({ minX: form.minX.value, minY: form.minY.value, minZ: form.minZ.value }));
       blockColorsCache = null;
       form.closest('dialog').close();
       await showSavedLayer(layer);
