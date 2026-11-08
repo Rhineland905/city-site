@@ -568,6 +568,7 @@ fieldset:disabled { opacity: .45; }
 }
 .area-tag .mono { color: var(--muted); font-size: 11px; }
 .area-tag.own { color: var(--amethyst); box-shadow: 0 0 8px rgba(192, 123, 255, .3); }
+.area-wait { color: #ffc670; font-size: 11px; }
 @media (max-width: 760px) {
   .live-areas li { grid-template-columns: minmax(0, 1fr) auto; }
   .live-areas li > .mono:not(.live-area-y) { grid-column: 1 / -1; grid-row: 2; }

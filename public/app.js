@@ -480,6 +480,8 @@ $('#markerForm [data-delete]').addEventListener('click', async () => {
 // здалеку мініатюри 16×16 (піксель на блок), зблизька картинки 256×256 (16 пікселів на блок, як у грі).
 const live = {
   layerId: null, epoch: null, since: 0, busy: false, polledAt: 0,
+  loaded: false, // список чанків цієї епохи вже прочитано
+  fastUntil: 0, // до цього часу питаємо про нові чанки частіше
   tiles: new Map(), // 'cx,cz' → { hash, at, player }
   minis: new Map(), // 'cx,cz' → 1024 байти RGBA
   imgs: new Map(), // 'cx,cz' → <img> на мапі
@@ -487,6 +489,7 @@ const live = {
   gen: 0,
 };
 const OV = 32;
+const FAST_MS = 3 * 60_000;
 const liveKey = (cx, cz) => cx + ',' + cz;
 const liveTileUrl = (cx, cz) =>
   `/api/live/${encodeURIComponent(live.layerId)}/tile/${cx}/${cz}?h=${live.tiles.get(liveKey(cx, cz)).hash}`;
@@ -538,6 +541,7 @@ function syncLive() {
 function resetLive(epoch) {
   live.epoch = epoch;
   live.since = 0;
+  live.loaded = false;
   live.gen++;
   live.tiles.clear();
   live.minis.clear();
@@ -554,8 +558,9 @@ async function pollLive() {
       const data = await api(`live/${encodeURIComponent(id)}?since=${since}`);
       if (id !== live.layerId) return;
       if ((data.live?.epoch ?? null) !== live.epoch) {
-        // Чанки стерли або змінили зріз: починаємо спочатку.
+        // Чанки стерли або змінили зріз: починаємо спочатку, а мод скоро намалює їх заново.
         resetLive(data.live?.epoch ?? null);
+        live.fastUntil = Date.now() + FAST_MS;
         liveTiles.redraw();
         if (data.live) continue;
         return;
@@ -567,6 +572,9 @@ async function pollLive() {
         live.tiles.set(key, { hash, at, player });
         if (at > live.since) live.since = at;
       }
+      const first = !live.loaded;
+      live.loaded = true;
+      if (first || changed.length) renderAreas(); // ярлики областей показують, скільки чанків ще чекають
       if (!changed.length) return;
       const res = await fetch(`/api/live/${encodeURIComponent(id)}/minis?since=${since}`, { cache: 'no-store' });
       if (!res.ok) throw new Error('Помилка ' + res.status);
@@ -594,7 +602,13 @@ async function pollLive() {
     renderLiveBadge();
   }
 }
-setInterval(() => { if (!document.hidden) pollLive(); }, 60_000);
+// Зазвичай сайт питає про нові чанки раз на хвилину. Після зміни зрізу чи області мод
+// перемальовує стерті чанки, тож кілька хвилин (FAST_MS) питаємо кожні 10 секунд, щоб вони з’явились одразу.
+setInterval(() => {
+  if (document.hidden) return;
+  const every = Date.now() < live.fastUntil ? 10_000 : 60_000;
+  if (Date.now() - live.polledAt >= every) pollLive();
+}, 2000);
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && Date.now() - live.polledAt > 60_000) pollLive();
 });
@@ -791,6 +805,7 @@ $('#liveLayers').addEventListener('click', async (e) => {
     }
     await loadLayers();
     live.layerId = null; // перечитати шар із новими налаштуваннями
+    live.fastUntil = Date.now() + FAST_MS;
     renderCityMap();
     renderLiveLayers();
     renderLiveStatus();
@@ -825,19 +840,35 @@ function renderAreas() {
   areaShapes.clearLayers();
   const layer = v3d.mode === '3d' ? null : currentLayer();
   if (!layer?.live || !isEditor()) return;
+  const counted = live.loaded && live.layerId === layer.id;
   for (const a of layer.liveAreas || []) {
     const own = a.top !== layer.live.top || a.bottom !== layer.live.bottom;
     const rect = L.rectangle(areaBounds(a), { ...AREA_STYLE, interactive: false, className: 'live-area' + (own ? ' own' : '') });
     rect.areaId = a.id;
     rect.addTo(areaShapes);
+    // Чанки без картинки з гри: щойно стерті після зміни зрізу або ще не відвідані.
+    const missing = counted ? areaMissing(a) : 0;
+    const wait = missing
+      ? ` <span class="area-wait">${missing} ${chunksWord(missing)} ${missing % 10 === 1 && missing % 100 !== 11 ? 'чекає' : 'чекають'} на мод</span>`
+      : '';
+    const title = missing ? 'Змінити область. Чанки без картинки мод намалює, коли поруч буде гравець із модом.' : 'Змінити область';
     const icon = L.divIcon({
       className: '', iconSize: null, iconAnchor: [0, 0],
-      html: `<span class="area-tag${own ? ' own' : ''}" title="Змінити область">${esc(areaName(layer, a))} <span class="mono">Y ${a.top}…${a.bottom}</span></span>`,
+      html: `<span class="area-tag${own ? ' own' : ''}" title="${title}">${esc(areaName(layer, a))} <span class="mono">Y ${a.top}…${a.bottom}</span>${wait}</span>`,
     });
     L.marker(toLatLng(a.minX, a.minZ), { icon, zIndexOffset: -200, title: areaName(layer, a) })
       .on('click', () => { if (!draw.layer && !placing) openArea(layer, a); })
       .addTo(areaShapes);
   }
+}
+function areaMissing(a) {
+  let n = 0;
+  for (let cz = Math.floor(a.minZ / 16); cz <= Math.floor(a.maxZ / 16); cz++) {
+    for (let cx = Math.floor(a.minX / 16); cx <= Math.floor(a.maxX / 16); cx++) {
+      if (!live.tiles.has(liveKey(cx, cz))) n++;
+    }
+  }
+  return n;
 }
 function flashArea(id) {
   areaShapes.eachLayer((r) => {
@@ -940,9 +971,14 @@ function renderAreaSize() {
 $('#areaForm').addEventListener('input', renderAreaSize);
 async function afterAreaChange(layerId, r, saved) {
   await loadLayers();
-  if (r.erased) live.layerId = null; // чанки стерлися: перечитуємо живий шар з нуля
+  if (r.erased) {
+    live.layerId = null; // чанки стерлися: перечитуємо живий шар з нуля
+    live.fastUntil = Date.now() + FAST_MS;
+  }
   renderCityMap();
-  const text = saved + (r.erased ? ` Стерто старих чанків: ${r.erased}, мод намалює їх заново.` : '');
+  const text = saved + (r.erased
+    ? ` Стерто старих чанків: ${r.erased}. Мод намалює їх заново, коли поруч буде гравець із модом, а доти там видно стару мапу.`
+    : '');
   if ($('#liveDialog').open) {
     // Тост сховався б під вікном, тож пишемо в рядок шару.
     renderLiveLayers();
