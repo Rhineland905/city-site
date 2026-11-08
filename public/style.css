@@ -429,6 +429,77 @@ fieldset:disabled { opacity: .45; }
 .mark-pop-actions, .ctx-pop { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
 .mark-pop-actions .btn, .ctx-pop .btn { padding: 4px 10px; font-size: 13px; }
 .ctx-pop { flex-direction: column; align-items: stretch; margin: 0; }
+
+/* Картинки міток: у спливашці, у вікні мітки й на весь екран */
+.mark-pop.has-img { width: 260px; }
+.mark-pop-imgs { display: flex; flex-direction: column; gap: 4px; margin-bottom: 2px; }
+.mark-pop-imgs button {
+  position: relative; display: block; width: 100%; padding: 0; overflow: hidden; cursor: zoom-in;
+  border: 1px solid var(--line-2); border-radius: 2px; background: var(--void);
+}
+.mark-pop-imgs button:hover { border-color: var(--c); box-shadow: 0 0 10px color-mix(in srgb, var(--c) 45%, transparent); }
+.mark-pop-imgs img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.mark-pop-imgs .cover { aspect-ratio: 16 / 9; }
+.mark-pop-imgs .strip { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
+.mark-pop-imgs .strip button { aspect-ratio: 1; }
+.mark-pop-imgs [data-more]::after {
+  content: attr(data-more); position: absolute; inset: 0; display: grid; place-items: center;
+  background: rgba(2, 8, 10, .7); color: var(--text); font-family: var(--pixel); font-size: 16px;
+}
+.mark-has-img { display: inline-flex; color: var(--muted); }
+.markers-list .mark-has-img svg { width: 14px; height: 14px; }
+
+.mark-imgs { display: flex; flex-direction: column; gap: 8px; border-radius: var(--radius); }
+.mark-imgs-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 500; color: var(--muted); }
+.mark-imgs-head .btn { margin-left: auto; padding: 3px 10px; font-size: 13px; }
+.mark-thumbs { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 6px; }
+.mark-thumbs:empty { display: none; }
+.mark-thumbs li { position: relative; }
+.mark-thumbs .thumb {
+  display: block; width: 100%; aspect-ratio: 4 / 3; padding: 0; overflow: hidden; cursor: zoom-in;
+  border: 2px solid var(--line); border-radius: var(--radius); background: var(--void);
+}
+.mark-thumbs .thumb:hover, .mark-thumbs .thumb:focus-visible { border-color: var(--soul); box-shadow: var(--soul-glow); outline: none; }
+.mark-thumbs img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.mark-thumbs .new .thumb { border-style: dashed; border-color: var(--soul); }
+.thumb-x {
+  position: absolute; top: 4px; right: 4px; width: 24px; height: 24px; padding: 0; cursor: pointer;
+  border: 1px solid var(--line-2); border-radius: 2px; background: rgba(4, 8, 10, .85);
+  color: var(--text); font-size: 17px; line-height: 1;
+}
+.thumb-x:hover, .thumb-x:focus-visible { color: var(--danger); border-color: var(--danger); outline: none; }
+.thumb-tag {
+  position: absolute; left: 5px; bottom: 5px; padding: 0 5px; border-radius: 2px; pointer-events: none;
+  background: var(--soul); color: var(--on-soul); font-size: 11px; font-weight: 600;
+}
+#markerDialog.dropping .mark-imgs { outline: 2px dashed var(--soul); outline-offset: 6px; box-shadow: 0 0 24px rgba(34, 225, 227, .2); }
+
+dialog.img-viewer {
+  width: 100vw; height: 100vh; height: 100dvh; max-width: none; max-height: none; margin: 0;
+  border: 0; border-radius: 0; background: rgba(2, 6, 8, .97); box-shadow: none;
+}
+dialog.img-viewer[open] { display: grid; grid-template-rows: minmax(0, 1fr) auto; }
+dialog.img-viewer::backdrop { background: #000; animation: none; }
+.iv-stage { position: relative; min-height: 0; padding: 14px 64px 0; touch-action: pan-y; }
+.iv-stage img { display: block; width: 100%; height: 100%; object-fit: contain; user-select: none; -webkit-user-drag: none; }
+.iv-nav {
+  position: absolute; top: 50%; transform: translateY(-50%); width: 46px; height: 68px; cursor: pointer;
+  border: 2px solid var(--line-2); border-radius: var(--radius); background: rgba(10, 23, 27, .85);
+  color: var(--text); font-size: 34px; line-height: 1;
+}
+.iv-nav:hover, .iv-nav:focus-visible { border-color: var(--soul); color: var(--soul); box-shadow: var(--soul-glow); outline: none; }
+.iv-nav.prev { left: 9px; }
+.iv-nav.next { right: 9px; }
+.iv-bar { display: flex; align-items: center; gap: 12px; padding: 10px 16px 14px; }
+.iv-bar [data-count] { flex: none; white-space: nowrap; }
+.iv-title { min-width: 0; font-family: var(--pixel); font-size: 18px; color: var(--soul); text-shadow: 0 0 12px rgba(34, 225, 227, .35); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 760px) {
+  .iv-stage { padding: 8px 0 0; }
+  .iv-nav { width: 38px; height: 56px; font-size: 28px; }
+  .iv-nav.prev { left: 4px; }
+  .iv-nav.next { right: 4px; }
+  .iv-bar { gap: 8px; padding: 8px 10px 12px; }
+}
 .ctx-pop .mono { color: var(--soul); }
 .btn.on { border-color: var(--soul); color: var(--soul); box-shadow: var(--soul-glow); }
 .btn .count {
@@ -466,7 +537,7 @@ fieldset:disabled { opacity: .45; }
 .markers-list li.muted { padding: 6px 4px; }
 .markers-list button {
   --c: var(--soul);
-  width: 100%; display: grid; grid-template-columns: 20px 1fr auto; gap: 8px; align-items: center;
+  width: 100%; display: grid; grid-template-columns: 20px minmax(0, 1fr) auto auto; gap: 8px; align-items: center;
   padding: 6px 8px; background: transparent; color: var(--text); text-align: left; cursor: pointer;
   border: 1px solid transparent; border-radius: 2px; font: inherit;
 }

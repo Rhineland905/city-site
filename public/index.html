@@ -223,6 +223,15 @@
         <select name="dimension"><option value="overworld">Верхній світ</option><option value="nether">Незер</option><option value="end">Енд</option></select>
       </label>
       <label>Опис<textarea name="description" rows="3" maxlength="1000" placeholder="Що тут, як дійти, чия це будівля"></textarea></label>
+      <div class="mark-imgs" data-imgs>
+        <div class="mark-imgs-head">
+          <span>Картинки</span>
+          <button type="button" class="btn" data-img-add>+ Додати</button>
+          <input type="file" data-img-file accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+        </div>
+        <ul class="mark-thumbs" data-thumbs></ul>
+        <p class="muted small" data-img-hint></p>
+      </div>
       <p class="muted small" data-meta></p>
       <p class="error" data-error></p>
       <div class="actions">
@@ -306,6 +315,22 @@
         <button class="btn primary">Зберегти</button>
       </div>
     </form>
+  </dialog>
+
+  <!-- Картинки мітки на весь екран -->
+  <dialog id="imgViewer" class="img-viewer" aria-label="Картинки мітки">
+    <div class="iv-stage" data-stage>
+      <img data-img alt="">
+      <button type="button" class="iv-nav prev" data-prev aria-label="Попередня картинка">‹</button>
+      <button type="button" class="iv-nav next" data-next aria-label="Наступна картинка">›</button>
+    </div>
+    <div class="iv-bar">
+      <span class="iv-title" data-caption></span>
+      <span class="muted" data-count></span>
+      <span class="spacer"></span>
+      <a class="btn ghost" data-open target="_blank" rel="noopener">Оригінал</a>
+      <button type="button" class="btn" data-cancel>Закрити</button>
+    </div>
   </dialog>
 
   <div class="toast" id="toast" hidden></div>
