@@ -1,6 +1,7 @@
 // 3D-просмотр схематиков и всего города (three.js).
 // Сплошные блоки собираются в одну сетку, рисуются только видимые грани.
 // Свет фонарей и свечей рисуется мягкими точками, как в Глубокой тьме.
+// Если в браузере выбран .jar игры, блоки строятся по настоящим моделям с текстурами (buildTextured).
 import * as THREE from 'three';
 import { OrbitControls } from './vendor/three/OrbitControls.js';
 import { blockColor, isAir, isNatural } from './blocks.js';
@@ -78,16 +79,20 @@ class MeshBuilder {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(this.pos.get().slice(), 3));
     geo.setAttribute('color', new THREE.BufferAttribute(this.col.get().slice(), 3));
-    const quads = this.verts / 4;
-    const idx = new Uint32Array(quads * 6);
-    for (let q = 0, v = 0, o = 0; q < quads; q++, v += 4) {
-      idx[o++] = v; idx[o++] = v + 1; idx[o++] = v + 2;
-      idx[o++] = v; idx[o++] = v + 2; idx[o++] = v + 3;
-    }
-    geo.setIndex(new THREE.BufferAttribute(idx, 1));
+    geo.setIndex(quadIndex(this.verts / 4));
     geo.computeBoundingSphere();
     return new THREE.Mesh(geo, material);
   }
+}
+
+// Два треугольника на каждый четырёхугольник (вершины идут по кругу).
+function quadIndex(quads) {
+  const idx = new Uint32Array(quads * 6);
+  for (let q = 0, v = 0, o = 0; q < quads; q++, v += 4) {
+    idx[o++] = v; idx[o++] = v + 1; idx[o++] = v + 2;
+    idx[o++] = v; idx[o++] = v + 2; idx[o++] = v + 3;
+  }
+  return new THREE.BufferAttribute(idx, 1);
 }
 
 // Небольшая «зернистость», чтобы стены не были плоскими, как текстура блоков.
@@ -110,9 +115,21 @@ function glowTexture() {
   return new THREE.CanvasTexture(c);
 }
 
+function glowPoints(pos, col, clippingPlanes) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos.get().slice(), 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col.get().slice(), 3));
+  return new THREE.Points(geo, new THREE.PointsMaterial({
+    size: 3.2, map: glowTexture(), vertexColors: true, transparent: true, opacity: 0.75,
+    depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true, clippingPlanes,
+  }));
+}
+
 // colors: средние цвета блоков из текстур игры { 'minecraft:grass_block': ['#верх', '#бок'] }.
 // Без них цвета берутся из таблицы в blocks.js.
-export function buildModel(schem, { hideNatural = false, clippingPlanes = [], colors = null } = {}) {
+// baked + atlas: модели блоков и атлас текстур из .jar игры (textures.js → bakeBlocks, atlasTexture).
+export function buildModel(schem, { hideNatural = false, clippingPlanes = [], colors = null, baked = null, atlas = null } = {}) {
+  if (baked && atlas) return buildTextured(schem, baked, atlas, { hideNatural, clippingPlanes });
   const { width: W, height: H, length: L, blocks, palette } = schem;
   const WL = W * L;
   const cls = palette.map((n) => classify(n || 'minecraft:air', hideNatural));
@@ -192,16 +209,171 @@ export function buildModel(schem, { hideNatural = false, clippingPlanes = [], co
     vertexColors: true, transparent: true, opacity: 0.4, depthWrite: false, clippingPlanes,
   }));
   if (glassMesh) group.add(glassMesh);
-  if (glowPos.n) {
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(glowPos.get().slice(), 3));
-    geo.setAttribute('color', new THREE.BufferAttribute(glowCol.get().slice(), 3));
-    group.add(new THREE.Points(geo, new THREE.PointsMaterial({
-      size: 3.2, map: glowTexture(), vertexColors: true, transparent: true, opacity: 0.75,
-      depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true, clippingPlanes,
-    })));
+  if (glowPos.n) group.add(glowPoints(glowPos, glowCol, clippingPlanes));
+  return { group, faces, size: { x: W, y: H, z: L }, textured: false };
+}
+
+// ---------- Блоки с текстурами игры ----------
+// Четырёхугольники моделей приходят из textures.js (по QUAD чисел, стороны в порядке DIRS, как там).
+// Текстуры лежат в атласе-стопке (DataArrayTexture): каждая грань берёт свой слой, и соседние
+// текстуры не протекают друг в друга даже на уменьшенных копиях.
+const QUAD = 24;
+const DIRS = [[0, 1, 0], [0, -1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]]; // верх низ север юг запад восток
+const LIFT = 1.25; // город из глубинного сланца тёмный: чуть высветляем, как и цветную модель
+const GLOW = 1.2; // яркость светящихся блоков: лампы, фонари, лава
+
+// Растущий типизированный массив.
+class Grow {
+  constructor(Type, n = 1 << 16) { this.Type = Type; this.a = new Type(n); this.n = 0; }
+  room(k) {
+    if (this.n + k <= this.a.length) return;
+    const b = new this.Type(Math.max(this.a.length * 2, this.n + k));
+    b.set(this.a);
+    this.a = b;
   }
-  return { group, faces, size: { x: W, y: H, z: L } };
+  get() { return this.a.slice(0, this.n); }
+}
+
+// Вершины компактные: координаты Int16 в долях блока (1/scale), uv в Uint16, слой атласа и яркость.
+// Так на вершину уходит 14 байт, и даже город с породой помещается в память видеокарты.
+class TexBuilder {
+  constructor(scale) {
+    this.s = scale;
+    this.pos = new Grow(Int16Array);
+    this.uv = new Grow(Uint16Array);
+    this.lb = new Grow(Uint16Array);
+    this.quads = 0;
+  }
+  quad(q, o, x, y, z, light) {
+    const s = this.s, P = this.pos, U = this.uv, B = this.lb;
+    P.room(12); U.room(8); B.room(8);
+    const layer = q[o + 20], l = Math.min(65535, Math.round(light * 256));
+    for (let k = 0; k < 4; k++) {
+      P.a[P.n++] = Math.round((x + q[o + k * 3]) * s);
+      P.a[P.n++] = Math.round((y + q[o + k * 3 + 1]) * s);
+      P.a[P.n++] = Math.round((z + q[o + k * 3 + 2]) * s);
+      U.a[U.n++] = Math.round(Math.min(1, Math.max(0, q[o + 12 + k * 2])) * 65535);
+      U.a[U.n++] = Math.round(Math.min(1, Math.max(0, q[o + 13 + k * 2])) * 65535);
+      B.a[B.n++] = layer;
+      B.a[B.n++] = l;
+    }
+    this.quads++;
+  }
+  build(material) {
+    if (!this.quads) return null;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(this.pos.get(), 3));
+    geo.setAttribute('uv16', new THREE.BufferAttribute(this.uv.get(), 2, true));
+    geo.setAttribute('lb', new THREE.BufferAttribute(this.lb.get(), 2));
+    geo.setIndex(quadIndex(this.quads));
+    geo.computeBoundingSphere();
+    const mesh = new THREE.Mesh(geo, material);
+    mesh.scale.setScalar(1 / this.s);
+    return mesh;
+  }
+}
+
+// MeshBasicMaterial, который берёт цвет из слоя атласа и умножает на яркость грани.
+function atlasMaterial(atlas, clippingPlanes, translucent) {
+  const m = new THREE.MeshBasicMaterial({
+    clippingPlanes, transparent: translucent, depthWrite: !translucent, alphaTest: translucent ? 0.02 : 0.5,
+  });
+  m.onBeforeCompile = (sh) => {
+    sh.uniforms.atlas = { value: atlas };
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute vec2 uv16;\nattribute vec2 lb;\nvarying vec3 vTex;\nvarying float vLight;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\n\tvTex = vec3(uv16, lb.x);\n\tvLight = lb.y / 256.0;');
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform highp sampler2DArray atlas;\nvarying vec3 vTex;\nvarying float vLight;')
+      .replace('#include <map_fragment>', '\tdiffuseColor *= texture(atlas, vTex);\n\tdiffuseColor.rgb *= vLight;');
+  };
+  m.customProgramCacheKey = () => 'mc-atlas';
+  return m;
+}
+
+// Атлас из textures.js ({ size, count, data }) → текстура-стопка. null, если видеокарта не потянет:
+// тогда город остаётся цветным.
+export function atlasTexture(atlas, renderer) {
+  if (!renderer.capabilities.isWebGL2) return null;
+  const gl = renderer.getContext();
+  if (atlas.count > gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS)) return null;
+  const t = new THREE.DataArrayTexture(atlas.data, atlas.size, atlas.size, atlas.count);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.magFilter = THREE.NearestFilter; // вблизи пиксели, как в игре
+  t.minFilter = THREE.LinearMipmapLinearFilter; // издалека без ряби
+  t.generateMipmaps = true;
+  t.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+  t.needsUpdate = true;
+  return t;
+}
+
+// Одинаковые блоки с несколькими случайными моделями (глубинный сланец) выбирают модель по месту.
+const pick = (x, y, z, n) => {
+  let h = Math.imul(x, 3129871) ^ Math.imul(z, 116129781) ^ y;
+  h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
+  return ((h ^ (h >>> 16)) >>> 0) % n;
+};
+
+function buildTextured(schem, baked, atlas, { hideNatural, clippingPlanes }) {
+  const { width: W, height: H, length: L, blocks, palette } = schem;
+  const states = schem.states || palette;
+  const WL = W * L;
+  const B = baked.blocks;
+  const vis = palette.map((n, i) => !!B[i] && !(hideNatural && isNatural(n || 'minecraft:air')));
+  // Стороны, которые блок закрывает целиком непрозорными гранями: такие грани соседей не рисуем.
+  const solid = palette.map((n, i) => (vis[i] ? B[i].solidMask ?? (B[i].solid ? 63 : 0) : 0));
+  const kind = palette.map((n) => classify(n || 'minecraft:air', false).k);
+  const lit = states.map((s) => !/lit=false/.test(s || ''));
+  const bright = kind.map((k, i) => (k === K.emissive || k === K.light) && lit[i]);
+  const lights = palette.map((n) => new THREE.Color(lightColor(n || '')));
+  const scale = Math.max(1, Math.min(64, Math.floor(32767 / (Math.max(W, H, L) + 1))));
+  const opaque = new TexBuilder(scale), trans = new TexBuilder(scale);
+  const glowPos = new Buf(1024), glowCol = new Buf(1024);
+  let faces = 0;
+
+  for (let y = 0; y < H; y++) {
+    for (let z = 0; z < L; z++) {
+      for (let x = 0; x < W; x++) {
+        const i = x + z * W + y * WL;
+        const id = blocks[i];
+        if (!vis[id]) continue;
+        const b = B[id];
+        let q = b.variants.length > 1 ? b.variants[pick(x, y, z, b.variants.length)] : b.variants[0];
+        // Верх воды и лавы чуть ниже края, если над ними не та же жидкость.
+        if (b.surface && b.surface.length) {
+          const up = y + 1 < H ? blocks[i + WL] : -1;
+          if (!(up >= 0 && vis[up] && B[up].group === b.group)) q = b.surface;
+        }
+        for (let o = 0; o < q.length; o += QUAD) {
+          const cull = q[o + 21];
+          if (cull >= 0) {
+            const d = DIRS[cull];
+            const nx = x + d[0], ny = y + d[1], nz = z + d[2];
+            if (nx >= 0 && ny >= 0 && nz >= 0 && nx < W && ny < H && nz < L) {
+              const nb = blocks[nx + nz * W + ny * WL];
+              if (solid[nb] & (1 << (cull ^ 1))) continue; // сосед закрывает эту грань
+              if (b.full && vis[nb] && B[nb].full && B[nb].group === b.group) continue; // стекло к стеклу, вода к воде
+            }
+          }
+          (q[o + 23] === 2 ? trans : opaque).quad(q, o, x, y, z, bright[id] ? GLOW : q[o + 22] * LIFT);
+          faces++;
+        }
+        if (kind[id] === K.light && lit[id]) {
+          glowPos.push3(x + 0.5, y + 0.6, z + 0.5);
+          const lc = lights[id];
+          glowCol.push3(lc.r, lc.g, lc.b);
+        }
+      }
+    }
+  }
+
+  const group = new THREE.Group();
+  const om = opaque.build(atlasMaterial(atlas, clippingPlanes, false));
+  if (om) group.add(om);
+  const tm = trans.build(atlasMaterial(atlas, clippingPlanes, true));
+  if (tm) { tm.renderOrder = 1; group.add(tm); }
+  if (glowPos.n) group.add(glowPoints(glowPos, glowCol, clippingPlanes));
+  return { group, faces, size: { x: W, y: H, z: L }, textured: true };
 }
 
 function disposeGroup(group) {
@@ -233,6 +405,17 @@ export function createViewer(container, { fog = true } = {}) {
 
   let model = null;
   let markers = [];
+  // Атлас текстур живёт, пока не выбрали другие файлы игры: перестройка модели его не трогает.
+  let atlasOf = null, atlas = null;
+  const atlasFor = (baked) => {
+    if (!baked) return null;
+    if (atlasOf !== baked) {
+      atlas?.dispose();
+      atlas = atlasTexture(baked.atlas, renderer);
+      atlasOf = baked;
+    }
+    return atlas;
+  };
   const markerGroup = new THREE.Group();
   scene.add(markerGroup);
   let onPick = null;
@@ -253,7 +436,7 @@ export function createViewer(container, { fog = true } = {}) {
     setModel(schem, opts = {}) {
       const keepView = !!model && opts.keepView;
       if (model) { scene.remove(model.group); disposeGroup(model.group); }
-      model = buildModel(schem, { ...opts, clippingPlanes: [clipPlane] });
+      model = buildModel(schem, { ...opts, atlas: atlasFor(opts.baked), clippingPlanes: [clipPlane] });
       scene.add(model.group);
       if (!keepView) frame(model.size);
       return model;
@@ -296,6 +479,7 @@ export function createViewer(container, { fog = true } = {}) {
       ro.disconnect();
       controls.dispose();
       if (model) disposeGroup(model.group);
+      atlas?.dispose();
       disposeGroup(markerGroup);
       renderer.dispose();
       renderer.domElement.remove();

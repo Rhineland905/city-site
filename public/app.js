@@ -1281,9 +1281,60 @@ $('#layerSelect').addEventListener('change', (e) => {
   if (v3d.mode === '3d') show3d();
 });
 
+// ---------- Текстури з гри (для 3D і мапи зі схематика) ----------
+// .jar гри або ресурспак читається лише в цьому браузері й запам’ятовується в його IndexedDB, щоб
+// наступного разу не вибирати знову. На сайт файл не йде: текстури Mojang викладати не можна.
+const loadTextures = () => import('./textures.js');
+const packs = { files: null, assets: null, opening: null, baked: new WeakMap() };
+const packName = () => (packs.assets?.version ? `Minecraft ${packs.assets.version}` : (packs.files || []).map((f) => f.name).join(', '));
+
+// Файли гри, вибрані зараз або запам’ятані раніше; null, якщо їх немає.
+function getPacks() {
+  if (packs.assets) return Promise.resolve(packs.assets);
+  packs.opening ??= (async () => {
+    const tx = await loadTextures();
+    const files = await tx.rememberedPacks();
+    if (!files?.length) return null;
+    try {
+      const assets = await tx.openPacks(files);
+      if (!packs.assets) { packs.assets = assets; packs.files = files; }
+      return packs.assets;
+    } catch (e) {
+      console.warn('Запам’ятані файли гри не відкрились:', e);
+      tx.forgetPacks();
+      return null;
+    }
+  })().finally(() => { packs.opening = null; });
+  return packs.opening;
+}
+async function usePacks(files) {
+  const tx = await loadTextures();
+  const assets = await tx.openPacks(files); // кидає зрозумілу помилку, якщо це не файл гри
+  Object.assign(packs, { assets, files, baked: new WeakMap() });
+  tx.rememberPacks(files);
+  return assets;
+}
+async function dropPacks() {
+  const tx = await loadTextures();
+  await tx.forgetPacks();
+  Object.assign(packs, { assets: null, files: null, baked: new WeakMap() });
+}
+// Моделі блоків схематика з текстурами: збираються раз на схематик і набір файлів.
+function bakedFor(schem, onProgress) {
+  const assets = packs.assets;
+  if (!assets) return Promise.resolve(null);
+  let job = packs.baked.get(schem);
+  if (!job || job.assets !== assets) {
+    job = { assets, promise: loadTextures().then((tx) => tx.bakeBlocks(assets, schem.states, onProgress)) };
+    packs.baked.set(schem, job);
+    job.promise.catch(() => packs.baked.delete(schem));
+  }
+  return job.promise;
+}
+
 // ---------- 3D-режим ----------
 // Слой, нарисованный из схематика, хранит сам схематик, и город можно покрутить в 3D.
-const v3d = { mode: '2d', viewer: null, key: null, schem: null, layer: null };
+const v3d = { mode: '2d', viewer: null, key: null, schem: null, layer: null, baked: null, bakedWith: null };
 function syncMode() {
   const layer = currentLayer();
   $('#modeSeg').hidden = !layer?.model;
@@ -1336,6 +1387,7 @@ async function show3d() {
       v3d.colors = colors;
       v3d.layer = layer;
       v3d.key = key;
+      v3d.baked = v3d.bakedWith = null; // моделі блоків належать попередньому схематику
       $('#v3dRock').checked = naturalShare(schem) > 0.4;
       const clip = $('#v3dClip');
       clip.min = layer.model.minY;
@@ -1346,6 +1398,7 @@ async function show3d() {
     v3d.layer = layer;
     markers3d();
     v3dStatus('');
+    texture3d();
   } catch (err) {
     console.error(err);
     v3dStatus('Не вдалося відкрити 3D: ' + err.message);
@@ -1353,9 +1406,78 @@ async function show3d() {
 }
 
 function build3d(keepView) {
-  v3d.viewer.setModel(v3d.schem, { hideNatural: $('#v3dRock').checked, keepView, colors: v3d.colors });
+  const model = v3d.viewer.setModel(v3d.schem, {
+    hideNatural: $('#v3dRock').checked, keepView, colors: v3d.colors, baked: v3d.baked,
+  });
+  if (v3d.baked && !model.textured && !v3d.warned) {
+    v3d.warned = true;
+    toast('Ця відеокарта не тягне текстури в 3D, тому місто кольорове');
+  }
   applyClip();
 }
+
+// Текстури в 3D: якщо в цьому браузері є файли гри, місто перебудовується за справжніми моделями блоків.
+async function texture3d() {
+  const key = v3d.key, schem = v3d.schem;
+  if (!schem) return;
+  const assets = await getPacks();
+  renderTexInfo();
+  if (v3d.key !== key) return;
+  if (!assets) {
+    if (v3d.baked) { v3d.baked = v3d.bakedWith = null; build3d(true); }
+    return;
+  }
+  if (v3d.baked && v3d.bakedWith === assets) return; // уже з цими текстурами
+  try {
+    const baked = await bakedFor(schem, (done, total) => {
+      if (v3d.key === key) v3dStatus(`Накладаю текстури з гри: ${done} з ${total}…`);
+    });
+    if (v3d.key !== key || packs.assets !== assets) return;
+    v3dStatus('Будую місто з текстурами…');
+    await new Promise((r) => setTimeout(r, 30));
+    Object.assign(v3d, { baked, bakedWith: assets });
+    build3d(true);
+  } catch (err) {
+    console.error(err);
+    toast('Не вдалося накласти текстури: ' + err.message);
+  } finally {
+    if (v3d.key === key) v3dStatus('');
+  }
+}
+
+function renderTexInfo() {
+  const on = !!packs.assets;
+  $('#v3dTexBtn').textContent = on ? 'Прибрати текстури' : 'Текстури з гри';
+  $('#v3dTexInfo').innerHTML = on
+    ? `Текстури: ${esc(packName())}. Файл запам’ятано лише в цьому браузері, на сайт він не йде.`
+    : 'Щоб блоки були як у грі, вибери файл гри: <span class="mono">%APPDATA%\\.minecraft\\versions\\26.3\\26.3.jar</span>. Він читається лише в цьому браузері й нікуди не завантажується.';
+}
+renderTexInfo();
+$('#v3dTexBtn').addEventListener('click', async () => {
+  if (!packs.assets) { $('#v3dTexFile').click(); return; }
+  await dropPacks();
+  Object.assign(fromSchem, { assets: null, texName: '', tiles: null }); // і «Мапа зі схематика» без них
+  v3d.baked = v3d.bakedWith = null;
+  if (v3d.schem) build3d(true);
+  renderTexInfo();
+  toast('Текстури прибрано, файл гри забуто');
+});
+$('#v3dTexFile').addEventListener('change', async (e) => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  if (!files.length) return;
+  v3dStatus('Відкриваю файл гри…');
+  try {
+    await usePacks(files);
+    Object.assign(fromSchem, { assets: null, texName: '', tiles: null }); // діалог мапи візьме новий файл
+  } catch (err) {
+    v3dStatus('');
+    toast('Не вдалося прочитати файл: ' + err.message);
+    return;
+  }
+  v3dStatus('');
+  await texture3d();
+});
 function applyClip() {
   const clip = $('#v3dClip');
   const y = Number(clip.value);
@@ -1486,7 +1608,6 @@ $('#mapForm [data-delete]').addEventListener('click', async () => {
 // --- Слой из схематика всего города ---
 // Текстуры из файла игры подгружаются отдельным модулем: он нужен только редактору.
 const fromSchem = { schem: null, file: null, timer: 0, assets: null, texName: '', tiles: null, job: 0 };
-const loadTextures = () => import('./textures.js');
 const MB = 1024 * 1024;
 const TEX_HINT = $('#fromSchemForm [data-tex-info]').innerHTML;
 
@@ -1499,7 +1620,17 @@ $('#fromSchemBtn').addEventListener('click', () => {
   $('[data-info]', f).textContent = 'Велике місто може читатися кілька секунд.';
   $('[data-save-status]', f).textContent = '';
   if (fromSchem.assets) $('[data-tex-info]', f).textContent = `Текстури вже вибрано: ${fromSchem.texName}. Можна вибрати інший файл.`;
-  else $('[data-tex-info]', f).innerHTML = TEX_HINT;
+  else {
+    $('[data-tex-info]', f).innerHTML = TEX_HINT;
+    // Файл гри, вибраний раніше (тут або в 3D), запам’ятано в цьому браузері: беремо його.
+    getPacks().then((assets) => {
+      if (!assets || fromSchem.assets || !$('#fromSchemDialog').open) return;
+      fromSchem.assets = assets;
+      fromSchem.texName = packName();
+      $('[data-tex-info]', f).textContent = `Текстури: ${fromSchem.texName} (запам’ятано в цьому браузері). Можна вибрати інший файл.`;
+      prepareTiles(f);
+    });
+  }
   $('[data-preview]', f).innerHTML = '<span class="muted">Тут з’явиться мапа</span>';
   fillLayerSelect(f.layerId);
   const underground = state.layers.find((l) => /підзем|подзем/i.test(l.name));
@@ -1570,9 +1701,8 @@ $('#fromSchemForm').textures.addEventListener('change', async (e) => {
   fromSchem.tiles = null;
   info.textContent = 'Відкриваю файл гри…';
   try {
-    const { openPacks } = await loadTextures();
-    fromSchem.assets = await openPacks(files);
-    fromSchem.texName = fromSchem.assets.version ? `Minecraft ${fromSchem.assets.version}` : files.map((x) => x.name).join(', ');
+    fromSchem.assets = await usePacks(files);
+    fromSchem.texName = packName();
     info.textContent = `Текстури: ${fromSchem.texName}.` + (fromSchem.schem ? '' : ' Тепер вибери схематик.');
     await prepareTiles(f);
   } catch (err) {
@@ -1816,9 +1946,16 @@ async function openSchematic(id) {
     box.after(toggle);
     box.innerHTML = '';
     preview = createViewer(box, { fog: false });
-    const draw = () => preview.setModel(parsed, { hideNatural: cb.checked, keepView: true, colors });
+    let baked = null;
+    const draw = () => preview.setModel(parsed, { hideNatural: cb.checked, keepView: true, colors, baked });
     cb.addEventListener('change', draw);
     draw();
+    // Якщо в цьому браузері є файли гри, прев’ю теж з текстурами.
+    getPacks().then((assets) => assets && bakedFor(parsed)).then((b) => {
+      if (!b || !box.isConnected || !preview) return;
+      baked = b;
+      draw();
+    }).catch((e) => console.warn('Прев’ю без текстур:', e));
   } catch (err) {
     console.error(err);
     if (box.isConnected) box.innerHTML = '<div class="status">Не вдалося побудувати прев’ю, але файл можна скачати.</div>';
