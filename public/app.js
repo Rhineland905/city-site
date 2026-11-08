@@ -278,7 +278,7 @@ function renderPins() {
     const icon = L.divIcon({ className: '', html: `<div class="mark-pin" style="--c:${k.color}">${kindSvg(m.kind)}</div>`, iconSize: [26, 26] });
     const pin = L.marker(toLatLng(m.x + 0.5, m.z + 0.5), { icon, title: m.name, draggable: editor, riseOnHover: true })
       .bindTooltip(`<span style="--c:${k.color}">${esc(m.name)}</span>`, { permanent: true, direction: 'right', offset: [14, 0], className: 'mark-label' })
-      .bindPopup(() => pinPopup(m), { className: 'mark-popup', offset: [0, -10], maxWidth: 300 })
+      .bindPopup((layer) => { padPopup(layer.getPopup()); return pinPopup(m); }, { className: 'mark-popup', offset: [0, -10], maxWidth: 300 })
       .on('dragend', (e) => movePin(m, e.target.getLatLng()))
       .on('mouseover', () => pin.getTooltip()?.getElement()?.classList.add('hover'))
       .on('mouseout', () => pin.getTooltip()?.getElement()?.classList.remove('hover'))
@@ -287,16 +287,36 @@ function renderPins() {
   }
   syncLabels();
 }
+// Кнопки лежать поверх мапи (на телефоні знизу). Мапа зсувається так, щоб вони не закривали спливашку.
+function padPopup(popup) {
+  const box = map.getContainer().getBoundingClientRect();
+  const bar = $('.map-toolbar').getBoundingClientRect();
+  let top = 10, bottom = 10;
+  if (bar.height) {
+    if (bar.top - box.top < box.height / 2) top = Math.round(bar.bottom - box.top) + 10;
+    else bottom = Math.round(box.bottom - bar.top) + 10;
+  }
+  popup.options.autoPanPaddingTopLeft = L.point(10, top);
+  popup.options.autoPanPaddingBottomRight = L.point(10, bottom);
+}
 // Підписи видно, коли мапа наближена. Здалеку лишаються самі значки, щоб написи не злипались.
 function syncLabels() { map.getContainer().classList.toggle('labels-off', map.getZoom() < 1); }
 map.on('zoomend', syncLabels);
 
 function pinPopup(m) {
   const k = kindOf(m);
+  const imgs = m.images || [];
   const box = document.createElement('div');
-  box.className = 'mark-pop';
+  box.className = 'mark-pop' + (imgs.length ? ' has-img' : '');
   box.style.setProperty('--c', k.color);
-  box.innerHTML = `
+  // Перша картинка велика, ще до чотирьох дрібно під нею. Решту видно в перегляді на весь екран.
+  const more = imgs.length - 5;
+  const gallery = imgs.length ? `<div class="mark-pop-imgs">
+      <button type="button" class="cover" data-img="0" title="Відкрити картинку"><img src="${imgUrl(m, imgs[0], true)}" alt=""></button>
+      ${imgs.length > 1 ? `<div class="strip">${imgs.slice(1, 5).map((im, i) =>
+        `<button type="button" data-img="${i + 1}"${i === 3 && more > 0 ? ` data-more="+${more}"` : ''} title="Відкрити картинку"><img src="${imgUrl(m, im, true)}" alt="" loading="lazy"></button>`).join('')}</div>` : ''}
+    </div>` : '';
+  box.innerHTML = `${gallery}
     <div class="mark-pop-head">${kindSvg(m.kind)}<b>${esc(m.name)}</b></div>
     <div class="muted small">${k.label} · ${DIM_NAMES[m.dimension]}</div>
     <div class="mono">${fmtXYZ(m)}</div>
@@ -306,6 +326,8 @@ function pinPopup(m) {
       ${isEditor() ? '<button type="button" class="btn" data-edit>Змінити</button>' : ''}
     </div>`;
   box.addEventListener('click', async (e) => {
+    const pic = e.target.closest('[data-img]');
+    if (pic) openViewer(markerPics(m), Number(pic.dataset.img), m.name);
     if (e.target.closest('[data-edit]')) { map.closePopup(); openMarker(m); }
     if (e.target.closest('[data-copy]')) {
       const text = `${m.x} ${m.y ?? '~'} ${m.z}`;
@@ -377,7 +399,7 @@ function renderMarkersList() {
   const total = state.markers.filter((m) => m.dimension === state.dim).length;
   $('#markersBtn').innerHTML = total ? `Мітки <span class="count">${total}</span>` : 'Мітки';
   $('#markersList').innerHTML = list.length
-    ? list.map((m) => `<li><button type="button" data-id="${m.id}" style="--c:${kindOf(m).color}"><span class="mark-ico">${kindSvg(m.kind)}</span><span class="mark-name">${esc(m.name)}</span><span class="mono muted">${m.x} ${m.z}</span></button></li>`).join('')
+    ? list.map((m) => `<li><button type="button" data-id="${m.id}" style="--c:${kindOf(m).color}"><span class="mark-ico">${kindSvg(m.kind)}</span><span class="mark-name">${esc(m.name)}</span>${m.images?.length ? `<span class="mark-has-img" title="Картинок: ${m.images.length}">${PIC_SVG}</span>` : '<span></span>'}<span class="mono muted">${m.x} ${m.z}</span></button></li>`).join('')
     : `<li class="muted small">${total ? 'Нічого не знайдено' : 'Міток ще немає. ' + (isEditor() ? 'Натисни «+ Мітка».' : 'Їх ставлять редактори.')}</li>`;
 }
 $('#markersList').addEventListener('click', (e) => {
@@ -439,6 +461,7 @@ function openMarker(m, prefill = {}) {
   $$('input, textarea, select', f).forEach((el) => (el.disabled = !editor));
   $('button.primary', f).hidden = !editor;
   $('[data-delete]', f).hidden = !editor || !m;
+  resetPics(m);
   openDialog('#markerDialog');
   if (editor && !m) f.name.focus();
 }
@@ -453,9 +476,21 @@ $('#markerForm').addEventListener('submit', (e) => {
     };
     if (!form.dataset.id) body.author = store.get('author') || '';
     store.set('lastKind', body.kind);
+    await picEdit.preparing; // картинки, які ще стискаються, теж мають потрапити в мітку
     const saved = form.dataset.id
       ? await api('markers/' + form.dataset.id, { method: 'PATCH', json: body })
       : await api('markers', { method: 'POST', json: body });
+    // Далі мітка вже є: якщо картинка не завантажиться, повторне «Зберегти» не створить другу таку саму.
+    form.dataset.id = saved.id;
+    picEdit.marker = saved;
+    try {
+      await syncPics(saved.id, form);
+    } catch (err) {
+      $('[data-title]', form).textContent = 'Мітка';
+      $('[data-delete]', form).hidden = false;
+      await loadMarkers().catch(() => {});
+      throw new Error(`Мітку збережено, але картинки — ні: ${err.message}. Натисни «Зберегти» ще раз.`);
+    }
     form.closest('dialog').close();
     await loadMarkers();
     toast(`Мітку «${saved.name}» збережено`);
@@ -474,6 +509,218 @@ $('#markerForm [data-delete]').addEventListener('click', async () => {
     toast('Мітку видалено');
   } catch (err) { showError(form, err.message); }
 });
+
+// --- Картинки міток ---
+// Сайт сам зменшує картинку до 1920 px (WebP, а де його немає — JPEG) і робить мініатюру для спливашки,
+// тож скріншот на кілька мегабайт важить кількасот КБ. Нові картинки завантажуються після «Зберегти».
+const PIC_MAX = 1920, PIC_THUMB = 480, PIC_LIMIT = 12;
+const PIC_KEEP = 600 * 1024; // невелику картинку потрібного розміру не перестискаємо
+const PIC_SVG = '<svg viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M1 3h14v10H1zm2 2v6h10V5zm1 5 3-3 2 2 1-1 2 2z"/></svg>';
+const imgUrl = (m, im, thumb) => `/api/markers/${m.id}/images/${im.id}${thumb ? '?t' : ''}`;
+const markerPics = (m) => (m.images || []).map((im) => ({ full: imgUrl(m, im), thumb: imgUrl(m, im, true) }));
+const picEdit = { marker: null, items: [], preparing: Promise.resolve(), gen: 0 };
+
+async function encodePic(bmp, max, quality) {
+  const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
+  const w = Math.max(1, Math.round(bmp.width * k)), h = Math.max(1, Math.round(bmp.height * k));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  g.imageSmoothingQuality = 'high';
+  g.drawImage(bmp, 0, 0, w, h);
+  const toBlob = (type, q) => new Promise((done) => c.toBlob(done, type, q));
+  let blob = await toBlob('image/webp', quality);
+  if (!blob || blob.type !== 'image/webp') blob = await toBlob('image/jpeg', quality); // старий Safari не вміє WebP
+  if (!blob) throw new Error('браузер не зміг стиснути картинку');
+  return { blob, w, h };
+}
+
+async function preparePic(file) {
+  let bmp;
+  try { bmp = await createImageBitmap(file); } catch {
+    throw new Error(`не вдалося відкрити «${file.name || 'картинку'}». Підійдуть PNG, JPG або WebP`);
+  }
+  try {
+    const side = Math.max(bmp.width, bmp.height);
+    const keep = ['image/png', 'image/jpeg', 'image/webp'].includes(file.type) && file.size <= PIC_KEEP && side <= PIC_MAX;
+    let big = keep ? { blob: file, w: bmp.width, h: bmp.height } : await encodePic(bmp, PIC_MAX, 0.86);
+    if (big.blob.size > 2.8 * 1024 * 1024) big = await encodePic(bmp, PIC_MAX, 0.7);
+    const thumb = side > PIC_THUMB ? (await encodePic(bmp, PIC_THUMB, 0.8)).blob : null;
+    return { ...big, thumb };
+  } finally { bmp.close?.(); }
+}
+
+function resetPics(m) {
+  for (const it of picEdit.items) if (it.local) { URL.revokeObjectURL(it.url); URL.revokeObjectURL(it.full); }
+  picEdit.gen++; // картинка, що ще стискалася для попередньої мітки, сюди вже не потрапить
+  picEdit.marker = m || null;
+  picEdit.items = (m?.images || []).map((im) => ({ im }));
+  renderPics();
+}
+$('#markerDialog').addEventListener('close', () => resetPics(null));
+
+const shownPics = () => picEdit.items.filter((it) => !it.removed);
+function renderPics() {
+  const f = $('#markerForm');
+  const editor = isEditor();
+  const shown = shownPics();
+  $('[data-imgs]', f).hidden = !editor && !shown.length;
+  $('[data-img-add]', f).hidden = !editor || shown.length >= PIC_LIMIT;
+  const changed = picEdit.items.some((it) => it.local || it.removed);
+  const hint = $('[data-img-hint]', f);
+  hint.hidden = !editor;
+  hint.textContent = changed ? 'Зміни в картинках збережуться, коли натиснеш «Зберегти».'
+    : shown.length >= PIC_LIMIT ? `Більше ${PIC_LIMIT} картинок до однієї мітки додати не можна.`
+    : 'Скріншот можна вставити з буфера (Ctrl+V) або перетягнути у це вікно.';
+  $('[data-thumbs]', f).innerHTML = shown.map((it, i) => `
+    <li class="${it.local ? 'new' : ''}">
+      <button type="button" class="thumb" data-view="${i}" title="Відкрити"><img src="${esc(it.local ? it.url : imgUrl(picEdit.marker, it.im, true))}" alt=""></button>
+      ${editor ? `<button type="button" class="thumb-x" data-drop="${i}" aria-label="Прибрати картинку" title="Прибрати">×</button>` : ''}
+      ${it.local ? '<span class="thumb-tag">нова</span>' : ''}
+    </li>`).join('');
+}
+
+function queuePics(files) {
+  const f = $('#markerForm');
+  const list = [...files].filter((x) => x?.type?.startsWith('image/'));
+  if (!list.length) { showError(f, 'Тут можна додати лише картинки: PNG, JPG або WebP'); return; }
+  const gen = picEdit.gen;
+  picEdit.preparing = picEdit.preparing.then(async () => {
+    const room = PIC_LIMIT - shownPics().length;
+    if (gen !== picEdit.gen) return;
+    showError(f, list.length > room ? `До мітки можна додати до ${PIC_LIMIT} картинок, зайві пропущено` : '');
+    for (const file of list.slice(0, Math.max(0, room))) {
+      try {
+        const p = await preparePic(file);
+        if (gen !== picEdit.gen) return;
+        picEdit.items.push({ local: true, ...p, url: URL.createObjectURL(p.thumb || p.blob), full: URL.createObjectURL(p.blob) });
+        renderPics();
+      } catch (err) { showError(f, 'Картинку не додано: ' + err.message); }
+    }
+  });
+}
+
+// Застосовує зміни в картинках до збереженої мітки: спершу прибирає видалені, потім завантажує нові.
+async function syncPics(markerId, form) {
+  const btn = $('button.primary', form);
+  const label = btn.textContent;
+  const items = picEdit.items;
+  const adds = items.filter((it) => it.local);
+  try {
+    for (const it of items.filter((x) => x.removed)) {
+      await api(`markers/${markerId}/images/${it.im.id}`, { method: 'DELETE' });
+      items.splice(items.indexOf(it), 1);
+    }
+    for (const [n, it] of adds.entries()) {
+      btn.textContent = adds.length > 1 ? `Завантаження ${n + 1}/${adds.length}…` : 'Завантаження…';
+      const fd = new FormData();
+      const ext = (b) => b.type.split('/')[1].replace('jpeg', 'jpg');
+      fd.append('image', it.blob, 'image.' + ext(it.blob));
+      if (it.thumb) fd.append('thumb', it.thumb, 'thumb.' + ext(it.thumb));
+      fd.append('width', it.w);
+      fd.append('height', it.h);
+      const res = await api(`markers/${markerId}/images`, { method: 'POST', body: fd });
+      URL.revokeObjectURL(it.url); URL.revokeObjectURL(it.full);
+      items[items.indexOf(it)] = { im: res.image };
+      picEdit.marker = res;
+    }
+  } finally {
+    btn.textContent = label;
+    renderPics();
+  }
+}
+
+{
+  const f = $('#markerForm');
+  const dlg = $('#markerDialog');
+  const file = $('[data-img-file]', f);
+  $('[data-img-add]', f).addEventListener('click', () => file.click());
+  file.addEventListener('change', () => { if (file.files.length) queuePics(file.files); file.value = ''; });
+  $('[data-thumbs]', f).addEventListener('click', (e) => {
+    const shown = shownPics();
+    const drop = e.target.closest('[data-drop]');
+    if (drop) {
+      const it = shown[Number(drop.dataset.drop)];
+      if (it.local) {
+        URL.revokeObjectURL(it.url); URL.revokeObjectURL(it.full);
+        picEdit.items.splice(picEdit.items.indexOf(it), 1);
+      } else it.removed = true;
+      renderPics();
+      return;
+    }
+    const view = e.target.closest('[data-view]');
+    if (view) {
+      const pics = shown.map((it) => it.local ? { full: it.full, thumb: it.url }
+        : { full: imgUrl(picEdit.marker, it.im), thumb: imgUrl(picEdit.marker, it.im, true) });
+      openViewer(pics, Number(view.dataset.view), f.name.value || 'Нова мітка');
+    }
+  });
+  // Скріншот з буфера (Ctrl+V) або перетягнутий файл одразу стає картинкою мітки.
+  dlg.addEventListener('paste', (e) => {
+    const files = [...(e.clipboardData?.files || [])].filter((x) => x.type.startsWith('image/'));
+    if (!isEditor() || !files.length) return; // звичайний текст вставляється як завжди
+    e.preventDefault();
+    queuePics(files);
+  });
+  const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+  dlg.addEventListener('dragover', (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = isEditor() ? 'copy' : 'none';
+    if (isEditor()) dlg.classList.add('dropping');
+  });
+  dlg.addEventListener('dragleave', (e) => { if (!dlg.contains(e.relatedTarget)) dlg.classList.remove('dropping'); });
+  dlg.addEventListener('drop', (e) => {
+    dlg.classList.remove('dropping');
+    if (!hasFiles(e)) return;
+    e.preventDefault(); // інакше браузер відкриє файл замість сайту
+    if (isEditor()) queuePics(e.dataTransfer.files);
+  });
+}
+
+// Перегляд на весь екран: стрілки ← →, свайп на телефоні, Esc закриває.
+const viewer = { pics: [], i: 0 };
+function openViewer(pics, i, title) {
+  if (!pics.length) return;
+  const d = $('#imgViewer');
+  viewer.pics = pics;
+  $('[data-caption]', d).textContent = title || '';
+  $('[data-prev]', d).hidden = $('[data-next]', d).hidden = pics.length < 2;
+  showPic(i);
+  if (!d.open) d.showModal();
+}
+function showPic(i) {
+  const d = $('#imgViewer');
+  const n = viewer.pics.length;
+  viewer.i = ((i % n) + n) % n;
+  const pic = viewer.pics[viewer.i];
+  const img = $('[data-img]', d);
+  // Поки вантажиться велика картинка, видно мініатюру, яка вже є в кеші.
+  img.src = pic.thumb;
+  const full = new Image();
+  full.onload = () => { if (viewer.pics[viewer.i] === pic) img.src = pic.full; };
+  full.src = pic.full;
+  $('[data-count]', d).textContent = n > 1 ? `${viewer.i + 1} / ${n}` : '';
+  $('[data-open]', d).href = pic.full;
+}
+{
+  const d = $('#imgViewer');
+  $('[data-prev]', d).addEventListener('click', () => showPic(viewer.i - 1));
+  $('[data-next]', d).addEventListener('click', () => showPic(viewer.i + 1));
+  d.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowLeft') { e.preventDefault(); showPic(viewer.i - 1); }
+    if (e.key === 'ArrowRight') { e.preventDefault(); showPic(viewer.i + 1); }
+  });
+  let startX = null;
+  const stage = $('[data-stage]', d);
+  stage.addEventListener('pointerdown', (e) => { startX = e.clientX; });
+  stage.addEventListener('pointerup', (e) => {
+    const dx = startX === null ? 0 : e.clientX - startX;
+    startX = null;
+    if (Math.abs(dx) > 40 && viewer.pics.length > 1) showPic(viewer.i + (dx < 0 ? 1 : -1));
+  });
+  d.addEventListener('close', () => { $('[data-img]', d).removeAttribute('src'); viewer.pics = []; });
+}
 
 // ---------- Жива мапа ----------
 // Мод у грі малює чанки, які прогрузив гравець, і надсилає їх на сайт. Тут вони лягають поверх мапи:

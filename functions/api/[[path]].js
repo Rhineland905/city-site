@@ -60,7 +60,7 @@ const SCHEMA = [
     id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT DEFAULT '',
     kind TEXT NOT NULL DEFAULT 'other',
     x INTEGER NOT NULL, y INTEGER, z INTEGER NOT NULL, dimension TEXT NOT NULL DEFAULT 'overworld',
-    author TEXT DEFAULT '',
+    author TEXT DEFAULT '', images TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
   LIVE_SCHEMA,
@@ -68,6 +68,12 @@ const SCHEMA = [
 ];
 // Типи міток. Підписи й значки задає сайт (app.js), тут лише список дозволених.
 const MARKER_KINDS = ['home', 'farm', 'storage', 'mine', 'portal', 'shop', 'danger', 'other'];
+// Картинки міток: сайт сам зменшує їх перед завантаженням, тож 3 МБ із запасом. Лежать у KV
+// під mimg:<мітка>:<картинка> (і :t для мініатюри), список — у стовпчику images.
+const MARKER_IMAGES = 12;
+const MARKER_IMAGE_MAX = 3 * 1024 * 1024;
+const MARKER_THUMB_MAX = 300 * 1024;
+const IMAGE_TYPES = ['image/webp', 'image/jpeg', 'image/png'];
 
 const MAP_TASK_TITLE = 'Завантажити мапу міста';
 const MAP_TASK = `Місто під землею, тому звичайна мапа згори (і BlueMap сервера) його не показує. Потрібна мапа зрізу на висоті міста. Способи від найкращого до найпростішого:
@@ -132,6 +138,12 @@ function ensureSchema(env) {
         await saveLayers(env, layers.map((l) => (guessed(l) ? { ...l, originX: 4094, originZ: 1398 } : l)));
       }
     }
+    // Картинки міток з’явилися пізніше за таблицю: додаємо стовпчик, якщо його ще немає.
+    const cols = await env.DB.prepare('PRAGMA table_info(markers)').all();
+    if (!cols.results.some((c) => c.name === 'images')) {
+      await env.DB.prepare("ALTER TABLE markers ADD COLUMN images TEXT NOT NULL DEFAULT '[]'").run()
+        .catch((e) => { if (!/duplicate column/i.test(String(e))) throw e; }); // інший запит устиг першим
+    }
     // Жива мапа: один раз вмикаємо її для шару міста зі зрізом, з якого намальована мапа.
     const liveOn = await env.DB.prepare(
       "INSERT INTO settings (key, value) VALUES ('live_default', '1') ON CONFLICT(key) DO NOTHING"
@@ -175,7 +187,7 @@ export async function onRequest({ request, env, params, waitUntil }) {
     if (section === 'schematics') return await schematics(request, env, method, id, action);
     if (section === 'tasks') return await tasks(request, env, method, id);
     if (section === 'map') return await map(request, env, method, id, action);
-    if (section === 'markers') return await markers(request, env, method, id);
+    if (section === 'markers') return await markers(request, env, method, id, action, parts[3]);
     if (section === 'live') return await live(request, env, method, parts, waitUntil);
     if (section === 'colors' && method === 'GET') return json(await getColors(env));
     return fail(404, 'Не знайдено');
@@ -297,11 +309,17 @@ async function tasks(request, env, method, id) {
 }
 
 // Мітки на мапі: «Ферма заліза», «Склад», «Портал у Незер». Дивитися може кожен, ставити лише редактор.
-async function markers(request, env, method, id) {
+const markerOut = (row) => {
+  let images = [];
+  try { images = JSON.parse(row.images || '[]'); } catch { /* зіпсований список: без картинок */ }
+  return { ...row, images: Array.isArray(images) ? images : [] };
+};
+async function markers(request, env, method, id, action, imageId) {
   if (!id && method === 'GET') {
     const { results } = await env.DB.prepare('SELECT * FROM markers ORDER BY name COLLATE NOCASE').all();
-    return json(results);
+    return json(results.map(markerOut));
   }
+  if (action === 'images') return markerImages(request, env, method, id, imageId);
   if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
 
   const body = method === 'DELETE' ? {} : await request.json().catch(() => null);
@@ -334,7 +352,7 @@ async function markers(request, env, method, id) {
       `INSERT INTO markers (name, description, kind, x, y, z, dimension, author)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
     ).bind(m.name, m.description, m.kind, m.x, m.y, m.z, m.dimension, m.author).first();
-    return json(row, 201);
+    return json(markerOut(row), 201);
   }
 
   const markerId = Number(id);
@@ -349,11 +367,74 @@ async function markers(request, env, method, id) {
       `UPDATE markers SET name = ?, description = ?, kind = ?, x = ?, y = ?, z = ?, dimension = ?, author = ?,
        updated_at = datetime('now') WHERE id = ? RETURNING *`
     ).bind(m.name, m.description, m.kind, m.x, m.y, m.z, m.dimension, m.author, markerId).first();
-    return json(row);
+    return json(markerOut(row));
   }
   if (method === 'DELETE') {
     await env.DB.prepare('DELETE FROM markers WHERE id = ?').bind(markerId).run();
+    await Promise.all(markerOut(cur).images.flatMap((im) => [
+      env.FILES.delete(`mimg:${markerId}:${im.id}`), env.FILES.delete(`mimg:${markerId}:${im.id}:t`),
+    ]));
     return json({ ok: true });
+  }
+  return fail(405, 'Метод не підтримується');
+}
+
+// Картинки мітки: GET /markers/:id/images/:img (?t — мініатюра) для всіх, POST і DELETE для редактора.
+async function markerImages(request, env, method, id, imageId) {
+  const markerId = Number(id);
+  if (!Number.isInteger(markerId)) return fail(404, 'Мітку не знайдено');
+  if (imageId !== undefined && !/^[0-9a-f]{12}$/.test(imageId)) return fail(404, 'Картинку не знайдено');
+  if ((method === 'GET' || method === 'HEAD') && imageId) {
+    const thumb = new URL(request.url).searchParams.has('t');
+    let { value, metadata } = await env.FILES.getWithMetadata(`mimg:${markerId}:${imageId}${thumb ? ':t' : ''}`, 'arrayBuffer');
+    if (!value && thumb) ({ value, metadata } = await env.FILES.getWithMetadata(`mimg:${markerId}:${imageId}`, 'arrayBuffer'));
+    if (!value) return fail(404, 'Картинку не знайдено');
+    return new Response(value, {
+      headers: {
+        'content-type': metadata?.type || 'image/webp', 'x-content-type-options': 'nosniff',
+        'cache-control': 'public, max-age=31536000, immutable', // id картинки ніколи не повторюється
+      },
+    });
+  }
+  if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
+  const cur = await env.DB.prepare('SELECT * FROM markers WHERE id = ?').bind(markerId).first();
+  if (!cur) return fail(404, 'Мітку не знайдено');
+  const images = markerOut(cur).images;
+  const tooMany = () => fail(400, `До однієї мітки можна додати до ${MARKER_IMAGES} картинок`);
+
+  if (method === 'POST' && !imageId) {
+    if (images.length >= MARKER_IMAGES) return tooMany();
+    const form = await request.formData().catch(() => null);
+    const file = form?.get('image'), thumb = form?.get('thumb');
+    if (!file || typeof file === 'string' || !file.size) return fail(400, 'Не вибрано картинку');
+    if (!IMAGE_TYPES.includes(file.type)) return fail(400, 'Потрібна картинка PNG, JPG або WebP');
+    if (file.size > MARKER_IMAGE_MAX) return fail(400, 'Картинка більша за 3 МБ');
+    const hasThumb = thumb && typeof thumb !== 'string' && thumb.size && thumb.size <= MARKER_THUMB_MAX && IMAGE_TYPES.includes(thumb.type);
+    const w = int(form.get('width')), h = int(form.get('height'));
+    const im = { id: crypto.randomUUID().replaceAll('-', '').slice(0, 12), type: file.type, size: file.size, w: w > 0 ? w : null, h: h > 0 ? h : null };
+    const key = `mimg:${markerId}:${im.id}`;
+    await env.FILES.put(key, await file.arrayBuffer(), { metadata: { type: file.type } });
+    if (hasThumb) await env.FILES.put(key + ':t', await thumb.arrayBuffer(), { metadata: { type: thumb.type } });
+    // Додаємо в список одним запитом, щоб дві одночасні картинки не затерли одна одну.
+    const row = await env.DB.prepare(
+      `UPDATE markers SET images = json_insert(images, '$[#]', json(?)), updated_at = datetime('now')
+       WHERE id = ? AND json_array_length(images) < ? RETURNING *`
+    ).bind(JSON.stringify(im), markerId, MARKER_IMAGES).first();
+    if (!row) {
+      await Promise.all([env.FILES.delete(key), env.FILES.delete(key + ':t')]);
+      return tooMany();
+    }
+    return json({ ...markerOut(row), image: im }, 201);
+  }
+  if (method === 'DELETE' && imageId) {
+    if (!images.some((im) => im.id === imageId)) return fail(404, 'Картинку не знайдено');
+    const row = await env.DB.prepare(
+      `UPDATE markers SET updated_at = datetime('now'), images = (
+         SELECT json_group_array(json(value)) FROM json_each(markers.images) WHERE json_extract(value, '$.id') IS NOT ?
+       ) WHERE id = ? RETURNING *`
+    ).bind(imageId, markerId).first();
+    await Promise.all([env.FILES.delete(`mimg:${markerId}:${imageId}`), env.FILES.delete(`mimg:${markerId}:${imageId}:t`)]);
+    return row ? json(markerOut(row)) : fail(404, 'Мітку не знайдено');
   }
   return fail(405, 'Метод не підтримується');
 }
