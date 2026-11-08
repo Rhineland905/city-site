@@ -114,9 +114,10 @@ function bluemapLink(dim, x, y, z, distance) {
 // ---------- Карта ----------
 // В Minecraft X растёт на восток, Z на юг. В Leaflet: lat = -Z, lng = X.
 const toLatLng = (x, z) => L.latLng(-z, x);
+const CENTER = CONFIG.center || { x: 0, y: 64, z: 0 };
 const map = L.map('map', {
   crs: L.CRS.Simple, minZoom: -5, maxZoom: 5, zoomSnap: 0.5, attributionControl: false,
-}).setView([0, 0], -1);
+}).setView(toLatLng(CENTER.x, CENTER.z), -1);
 
 // Сетка координат, подписи кратны 16 (границам чанков).
 const GridLayer = L.GridLayer.extend({
@@ -185,6 +186,14 @@ function renderCityMap() {
 
 function renderMarkers() {
   markers.clearLayers();
+  if (CONFIG.center && state.dim === 'overworld') {
+    const { x, y, z } = CONFIG.center;
+    const icon = L.divIcon({ className: '', html: '<div class="center-pin"></div>', iconSize: [22, 22] });
+    L.marker(toLatLng(x + 0.5, z + 0.5), { icon, title: 'Центр міста', zIndexOffset: -100 })
+      .bindTooltip(`Центр міста <span class="mono">X ${x} · Y ${y} · Z ${z}</span>`,
+        { className: 'schem-label', direction: 'top', offset: [0, -12] })
+      .addTo(markers);
+  }
   for (const s of state.schematics) {
     if (s.dimension !== state.dim) continue;
     const icon = L.divIcon({ className: '', html: '<div class="schem-pin"></div>', iconSize: [18, 18] });
@@ -415,8 +424,16 @@ $('#fromSchemBtn').addEventListener('click', () => {
   const underground = state.layers.find((l) => /підзем|подзем/i.test(l.name));
   if (underground) { f.layerId.value = underground.id; f.name.value = underground.name; }
   f.dimension.value = state.dim;
+  fillCorner(f, underground);
   openDialog('#fromSchemDialog');
 });
+// Шар зі схематика пам’ятає свій найменший кут, тож при перемальовуванні координати вже стоять.
+function fillCorner(f, layer) {
+  if (!layer?.model) return;
+  f.minX.value = layer.originX;
+  f.minY.value = layer.model.minY;
+  f.minZ.value = layer.originZ;
+}
 
 $('#fromSchemForm').file.addEventListener('change', async (e) => {
   const f = e.target.form;
@@ -468,6 +485,7 @@ for (const name of ['minY', 'topY', 'bottomY']) {
 $('#fromSchemForm').layerId.addEventListener('change', (e) => {
   const layer = state.layers.find((l) => l.id === e.target.value);
   if (layer) { e.target.form.name.value = layer.name; e.target.form.dimension.value = layer.dimension; }
+  fillCorner(e.target.form, layer);
 });
 
 $('#fromSchemForm').addEventListener('submit', (e) => {

@@ -200,6 +200,16 @@ main { flex: 1; position: relative; min-height: 0; }
   text-shadow: 0 0 8px rgba(34, 225, 227, .4);
 }
 .schem-label::before { display: none; }
+/* Центр міста: ромб, як серце катализатора скалка. */
+.center-pin {
+  width: 22px; height: 22px; position: relative; transform: rotate(45deg);
+  background: var(--void); border: 2px solid var(--soul); border-radius: 2px;
+  box-shadow: 0 0 10px rgba(34, 225, 227, .55), 0 2px 8px rgba(0, 0, 0, .7);
+}
+.center-pin::after {
+  content: ""; position: absolute; inset: 5px; background: var(--soul);
+  box-shadow: 0 0 10px var(--soul);
+}
 
 /* Сетка схематиков */
 .schem-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }
