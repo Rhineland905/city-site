@@ -40,7 +40,16 @@ const SCHEMA = [
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
   `CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS markers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'other',
+    x INTEGER NOT NULL, y INTEGER, z INTEGER NOT NULL, dimension TEXT NOT NULL DEFAULT 'overworld',
+    author TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
 ];
+// Типи міток. Підписи й значки задає сайт (app.js), тут лише список дозволених.
+const MARKER_KINDS = ['home', 'farm', 'storage', 'mine', 'portal', 'shop', 'danger', 'other'];
 
 const MAP_TASK_TITLE = 'Завантажити мапу міста';
 const MAP_TASK = `Місто під землею, тому звичайна мапа згори (і BlueMap сервера) його не показує. Потрібна мапа зрізу на висоті міста. Способи від найкращого до найпростішого:
@@ -126,6 +135,7 @@ export async function onRequest({ request, env, params }) {
     if (section === 'schematics') return await schematics(request, env, method, id, action);
     if (section === 'tasks') return await tasks(request, env, method, id);
     if (section === 'map') return await map(request, env, method, id, action);
+    if (section === 'markers') return await markers(request, env, method, id);
     if (section === 'colors' && method === 'GET') return json(await getColors(env));
     return fail(404, 'Не знайдено');
   } catch (e) {
@@ -240,6 +250,68 @@ async function tasks(request, env, method, id) {
 
   if (method === 'DELETE') {
     await env.DB.prepare('DELETE FROM tasks WHERE id = ?').bind(taskId).run();
+    return json({ ok: true });
+  }
+  return fail(405, 'Метод не підтримується');
+}
+
+// Мітки на мапі: «Ферма заліза», «Склад», «Портал у Незер». Дивитися може кожен, ставити лише редактор.
+async function markers(request, env, method, id) {
+  if (!id && method === 'GET') {
+    const { results } = await env.DB.prepare('SELECT * FROM markers ORDER BY name COLLATE NOCASE').all();
+    return json(results);
+  }
+  if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
+
+  const body = method === 'DELETE' ? {} : await request.json().catch(() => null);
+  if (!body) return fail(400, 'Не вдалося прочитати мітку');
+  const optInt = (v) => (v === null || v === '' || v === undefined ? null : int(v));
+  const read = (cur = {}) => {
+    const has = (k) => body[k] !== undefined;
+    const m = {
+      name: has('name') ? str(body.name, 60) : cur.name,
+      description: has('description') ? str(body.description, 1000) : cur.description ?? '',
+      kind: has('kind') ? body.kind : cur.kind ?? 'other',
+      x: has('x') ? int(body.x) : cur.x,
+      y: has('y') ? optInt(body.y) : cur.y ?? null,
+      z: has('z') ? int(body.z) : cur.z,
+      dimension: has('dimension') ? body.dimension : cur.dimension ?? 'overworld',
+      author: has('author') ? str(body.author, 60) : cur.author ?? '',
+    };
+    if (!m.name) return 'Вкажи назву мітки';
+    if (!MARKER_KINDS.includes(m.kind)) return 'Невідомий тип мітки';
+    if (m.x === null || m.x === undefined || m.z === null || m.z === undefined) return 'Вкажи X і Z';
+    if (has('y') && body.y !== null && body.y !== '' && m.y === null) return 'Y має бути цілим числом';
+    if (!DIMENSIONS.includes(m.dimension)) return 'Невідомий вимір';
+    return m;
+  };
+
+  if (!id && method === 'POST') {
+    const m = read();
+    if (typeof m === 'string') return fail(400, m);
+    const row = await env.DB.prepare(
+      `INSERT INTO markers (name, description, kind, x, y, z, dimension, author)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
+    ).bind(m.name, m.description, m.kind, m.x, m.y, m.z, m.dimension, m.author).first();
+    return json(row, 201);
+  }
+
+  const markerId = Number(id);
+  if (!Number.isInteger(markerId)) return fail(404, 'Мітку не знайдено');
+  const cur = await env.DB.prepare('SELECT * FROM markers WHERE id = ?').bind(markerId).first();
+  if (!cur) return fail(404, 'Мітку не знайдено');
+
+  if (method === 'PATCH') {
+    const m = read(cur);
+    if (typeof m === 'string') return fail(400, m);
+    const row = await env.DB.prepare(
+      `UPDATE markers SET name = ?, description = ?, kind = ?, x = ?, y = ?, z = ?, dimension = ?, author = ?,
+       updated_at = datetime('now') WHERE id = ? RETURNING *`
+    ).bind(m.name, m.description, m.kind, m.x, m.y, m.z, m.dimension, m.author, markerId).first();
+    return json(row);
+  }
+  if (method === 'DELETE') {
+    await env.DB.prepare('DELETE FROM markers WHERE id = ?').bind(markerId).run();
     return json({ ok: true });
   }
   return fail(405, 'Метод не підтримується');

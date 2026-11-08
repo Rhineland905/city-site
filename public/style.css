@@ -395,3 +395,112 @@ fieldset:disabled { opacity: .45; }
   .v3d-panel { bottom: 64px; }
   .small-note { display: none; }
 }
+
+/* Мітки на мапі: темний блок із підсвіткою кольору свого типу. */
+.mark-pin {
+  --c: var(--soul);
+  width: 26px; height: 26px; display: grid; place-items: center;
+  background: var(--void); color: var(--c);
+  border: 2px solid var(--c); border-radius: 3px;
+  box-shadow: 0 0 10px color-mix(in srgb, var(--c) 55%, transparent), 0 2px 8px rgba(0, 0, 0, .7);
+  transition: transform .15s;
+}
+.mark-pin svg { width: 16px; height: 16px; filter: drop-shadow(0 0 3px color-mix(in srgb, var(--c) 70%, transparent)); }
+.leaflet-marker-icon:hover .mark-pin, .leaflet-marker-icon:focus-visible .mark-pin { transform: scale(1.15); }
+.leaflet-marker-draggable .mark-pin { cursor: grab; }
+.leaflet-dragging .leaflet-marker-draggable .mark-pin { cursor: grabbing; }
+.mark-label {
+  background: rgba(4, 8, 10, .86) !important; border: 1px solid var(--line-2) !important;
+  border-radius: 2px !important; box-shadow: none !important; padding: 1px 6px !important;
+  font-family: var(--pixel); font-size: 13px; white-space: nowrap;
+}
+.mark-label::before { display: none; }
+.mark-label span { color: var(--c); text-shadow: 0 0 8px color-mix(in srgb, var(--c) 50%, transparent); }
+.labels-off .mark-label:not(.hover) { display: none; }
+.placing, .placing .leaflet-interactive { cursor: crosshair !important; }
+
+.mark-pop { --c: var(--soul); min-width: 210px; display: flex; flex-direction: column; gap: 6px; }
+.mark-pop-head { display: flex; align-items: center; gap: 8px; color: var(--c); font-family: var(--pixel); font-size: 17px; }
+.mark-pop-head svg { width: 18px; height: 18px; flex: none; }
+.mark-pop-head b { font-weight: 600; }
+.mark-pop .mono { color: var(--soul); }
+.mark-pop p { margin: 0; white-space: pre-wrap; }
+.mark-pop-actions, .ctx-pop { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+.mark-pop-actions .btn, .ctx-pop .btn { padding: 4px 10px; font-size: 13px; }
+.ctx-pop { flex-direction: column; align-items: stretch; margin: 0; }
+.ctx-pop .mono { color: var(--soul); }
+.btn.on { border-color: var(--soul); color: var(--soul); box-shadow: var(--soul-glow); }
+.btn .count {
+  display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 4px; border-radius: 2px;
+  background: var(--soul-soft); color: var(--soul); font-size: 12px; text-align: center;
+}
+
+/* Список міток */
+.markers-panel {
+  position: absolute; top: 60px; right: 12px; z-index: 960;
+  width: min(330px, calc(100% - 24px)); max-height: calc(100% - 84px);
+  display: flex; flex-direction: column; gap: 10px; padding: 12px;
+  background: rgba(10, 23, 27, .97); border: 2px solid var(--line-2); border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.markers-head { display: flex; gap: 8px; }
+.markers-head input { flex: 1; min-width: 0; }
+.icon-btn {
+  flex: none; width: 36px; background: transparent; color: var(--muted); cursor: pointer;
+  border: 2px solid var(--line); border-radius: var(--radius); font-size: 20px; line-height: 1;
+}
+.icon-btn:hover { color: var(--soul); border-color: var(--soul); }
+.kind-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.kind-chips:empty { display: none; }
+.kind-chip {
+  --c: var(--soul);
+  display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px 2px 5px; cursor: pointer;
+  background: var(--panel-2); color: var(--c); border: 1px solid var(--line-2); border-radius: 2px;
+  font: 12px/1.6 Inter, system-ui, sans-serif;
+}
+.kind-chip svg { width: 14px; height: 14px; }
+.kind-chip .n { color: var(--muted); }
+.kind-chip[aria-pressed="false"] { opacity: .45; filter: grayscale(.8); }
+.markers-list { list-style: none; margin: 0; padding: 0; overflow: auto; display: flex; flex-direction: column; gap: 2px; min-height: 0; }
+.markers-list li.muted { padding: 6px 4px; }
+.markers-list button {
+  --c: var(--soul);
+  width: 100%; display: grid; grid-template-columns: 20px 1fr auto; gap: 8px; align-items: center;
+  padding: 6px 8px; background: transparent; color: var(--text); text-align: left; cursor: pointer;
+  border: 1px solid transparent; border-radius: 2px; font: inherit;
+}
+.markers-list button:hover, .markers-list button:focus-visible { background: var(--panel-2); border-color: var(--line-2); }
+.markers-list .mark-ico { color: var(--c); display: grid; }
+.markers-list svg { width: 18px; height: 18px; }
+.markers-list .mark-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.markers-list .mono { font-size: 12px; }
+.markers-tip { margin: 0; }
+.place-hint {
+  position: absolute; left: 50%; top: 64px; transform: translateX(-50%); z-index: 960;
+  display: flex; align-items: center; gap: 10px; padding: 8px 8px 8px 14px; white-space: nowrap;
+  background: rgba(10, 23, 27, .97); border: 2px solid var(--soul); border-radius: var(--radius);
+  box-shadow: var(--shadow), var(--soul-glow); font-family: var(--pixel); color: var(--soul);
+}
+.place-hint .btn { padding: 3px 10px; font-size: 13px; }
+
+/* Вибір типу в діалозі */
+.kind-pick { border: 0; padding: 0; margin: 0; min-width: 0; }
+.kind-pick legend { padding: 0; margin-bottom: 4px; font-size: 13px; font-weight: 500; color: var(--muted); }
+.kind-options { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+.form .kind-opt { --c: var(--soul); position: relative; display: block; }
+.kind-opt input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.kind-opt span {
+  display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 7px 2px 5px;
+  background: var(--panel-2); color: var(--muted); border: 2px solid var(--line); border-radius: var(--radius);
+  font-size: 12px; text-align: center;
+}
+.kind-opt svg { width: 20px; height: 20px; color: var(--c); }
+.kind-opt input:checked + span { border-color: var(--c); color: var(--text); box-shadow: 0 0 10px color-mix(in srgb, var(--c) 40%, transparent); }
+.kind-opt input:focus-visible + span { outline: 2px solid var(--soul); outline-offset: 2px; }
+.kind-opt input:disabled { cursor: default; }
+
+@media (max-width: 760px) {
+  .markers-panel { top: 12px; max-height: calc(100% - 150px); }
+  .place-hint { top: 12px; white-space: normal; width: calc(100% - 24px); justify-content: space-between; }
+  .kind-options { grid-template-columns: repeat(2, 1fr); }
+}
