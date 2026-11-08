@@ -54,10 +54,22 @@
         </div>
         <span class="coords mono" id="cursorCoords">X — · Z —</span>
         <a class="btn" id="bluemapBtn" target="_blank" rel="noopener" hidden>BlueMap</a>
+        <button class="btn" id="markersBtn" aria-expanded="false" aria-controls="markersPanel">Мітки</button>
+        <button class="btn editor-only" id="addMarkerBtn">+ Мітка</button>
         <button class="btn editor-only" id="fromSchemBtn">Мапа зі схематика</button>
         <button class="btn editor-only" id="uploadMapBtn">Завантажити картинку</button>
         <button class="btn primary editor-only" id="addSchemBtn">+ Схематик</button>
       </div>
+      <aside class="markers-panel" id="markersPanel" hidden>
+        <div class="markers-head">
+          <input type="search" id="markerSearch" placeholder="Знайти мітку" aria-label="Знайти мітку">
+          <button type="button" class="icon-btn" id="markersClose" aria-label="Закрити">×</button>
+        </div>
+        <div class="kind-chips" id="kindChips" role="group" aria-label="Показувати типи"></div>
+        <ul class="markers-list" id="markersList"></ul>
+        <p class="muted small editor-only markers-tip">Щоб поставити мітку, натисни «+ Мітка» і клацни на мапі. Мітку можна перетягнути.</p>
+      </aside>
+      <div class="place-hint" id="placeHint" hidden>Клацни на мапі, де поставити мітку. <button type="button" class="btn ghost" id="placeCancel">Скасувати</button></div>
       <div class="map-empty" id="mapEmpty" hidden>
         <p>Мапу міста ще не завантажено, тому мітки стоять на сітці координат.</p>
         <p class="muted">Як її зробити, написано в завданні «Завантажити мапу міста».</p>
@@ -120,7 +132,7 @@
         <label>Y<input name="y" type="number" step="1" required value="64"></label>
         <label>Z<input name="z" type="number" step="1" required></label>
       </div>
-      <p class="muted small">Підказка: клацни правою кнопкою по мапі, і X та Z підставляться самі.</p>
+      <p class="muted small">Підказка: клацни правою кнопкою по мапі й вибери «Додати схематик тут», і X та Z підставляться самі.</p>
       <label>Вимір
         <select name="dimension"><option value="overworld">Верхній світ</option><option value="nether">Незер</option><option value="end">Енд</option></select>
       </label>
@@ -191,6 +203,34 @@
     </form>
   </dialog>
   <datalist id="layerNames"><option value="Поверхня"><option value="Підземне місто"><option value="Поверх 1"><option value="Поверх 2"></datalist>
+
+  <dialog id="markerDialog">
+    <form method="dialog" class="form" id="markerForm">
+      <h2 data-title>Мітка</h2>
+      <label>Назва<input name="name" required maxlength="60" placeholder="Наприклад, Ферма заліза"></label>
+      <fieldset class="kind-pick">
+        <legend>Тип</legend>
+        <div class="kind-options" data-kinds></div>
+      </fieldset>
+      <div class="row3">
+        <label>X<input name="x" type="number" step="1" required></label>
+        <label>Y<input name="y" type="number" step="1" placeholder="необов’язково"></label>
+        <label>Z<input name="z" type="number" step="1" required></label>
+      </div>
+      <label>Вимір
+        <select name="dimension"><option value="overworld">Верхній світ</option><option value="nether">Незер</option><option value="end">Енд</option></select>
+      </label>
+      <label>Опис<textarea name="description" rows="3" maxlength="1000" placeholder="Що тут, як дійти, чия це будівля"></textarea></label>
+      <p class="muted small" data-meta></p>
+      <p class="error" data-error></p>
+      <div class="actions">
+        <button type="button" class="btn danger" data-delete hidden>Видалити</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn ghost" data-cancel>Закрити</button>
+        <button class="btn primary">Зберегти</button>
+      </div>
+    </form>
+  </dialog>
 
   <dialog id="taskDialog">
     <form method="dialog" class="form" id="taskForm">

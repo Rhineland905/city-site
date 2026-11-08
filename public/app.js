@@ -13,7 +13,7 @@ const store = {
 const DIM_NAMES = { overworld: 'Верхній світ', nether: 'Незер', end: 'Енд' };
 const state = {
   password: store.get('editPassword') || '',
-  schematics: [], tasks: [], layers: [],
+  schematics: [], tasks: [], layers: [], markers: [],
   dim: 'overworld',
   layerId: store.get('layerId'), // null = первый слой измерения, '' = только сетка
 };
@@ -52,7 +52,9 @@ const isEditor = () => document.body.classList.contains('editor');
 function setEditor(on) {
   document.body.classList.toggle('editor', on);
   $('#loginBtn').textContent = on ? 'Вийти' : 'Увійти';
-  if (!on) { state.password = ''; store.set('editPassword', null); }
+  if (!on) { state.password = ''; store.set('editPassword', null); setPlacing(false); }
+  renderPins(); // редактор може перетягувати мітки
+  renderMarkersList();
 }
 
 $('#loginBtn').addEventListener('click', () => {
@@ -223,10 +225,250 @@ map.on('moveend', updateBluemapButton);
 map.on('mousemove', (e) => {
   $('#cursorCoords').textContent = `X ${Math.floor(e.latlng.lng)} · Z ${Math.floor(-e.latlng.lat)}`;
 });
+// Правий клік: координати, а редактору ще й «поставити мітку» або «додати схематик» у цій точці.
 map.on('contextmenu', (e) => {
   const x = Math.floor(e.latlng.lng), z = Math.floor(-e.latlng.lat);
-  if (isEditor()) openSchemDialog({ x, z });
-  else L.popup().setLatLng(e.latlng).setContent(`<span class="mono">X ${x} · Z ${z}</span>`).openOn(map);
+  const box = document.createElement('div');
+  box.className = 'ctx-pop';
+  box.innerHTML = `<span class="mono">X ${x} · Z ${z}</span>` + (isEditor()
+    ? '<button type="button" class="btn" data-mark>Поставити мітку тут</button><button type="button" class="btn" data-schem>Додати схематик тут</button>'
+    : '');
+  const popup = L.popup().setLatLng(e.latlng).setContent(box).openOn(map);
+  box.addEventListener('click', (ev) => {
+    if (ev.target.closest('[data-mark]')) { map.closePopup(popup); openMarker(null, { x, z }); }
+    if (ev.target.closest('[data-schem]')) { map.closePopup(popup); openSchemDialog({ x, z }); }
+  });
+});
+
+// ---------- Мітки ----------
+// Значки намальовані в сітці 16×16, колір кожного типу задається змінною --c.
+const KINDS = {
+  home: { label: 'Будинок', color: '#e8b45a', icon: '<path d="M8 1.5 1 7.5h2V15h3.5v-4h3v4H13V7.5h2z"/>' },
+  farm: { label: 'Ферма', color: '#8fd14f', icon: '<path d="M7.25 6h1.5v9.5h-1.5z"/><path d="M8 1c1.4 1 1.4 3 0 4-1.4-1-1.4-3 0-4zM4.2 3.6c1.7.1 2.9 1.6 2.6 3.3-1.7-.1-2.9-1.6-2.6-3.3zM11.8 3.6c.3 1.7-.9 3.2-2.6 3.3-.3-1.7.9-3.2 2.6-3.3zM4.2 7.6c1.7.1 2.9 1.6 2.6 3.3-1.7-.1-2.9-1.6-2.6-3.3zM11.8 7.6c.3 1.7-.9 3.2-2.6 3.3-.3-1.7.9-3.2 2.6-3.3z"/>' },
+  storage: { label: 'Склад', color: '#d39a5b', icon: '<path d="M1.5 3h13v4.5h-13zM1.5 8.5h13V14h-13z"/><path d="M7 6h2v4H7z" fill="#04080a"/>' },
+  mine: { label: 'Шахта', color: '#a9b6c2', icon: '<g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 13.5 10 6.5"/><path d="M5 2.6Q12.6 3.4 13.4 11"/></g>' },
+  portal: { label: 'Портал', color: '#c07bff', icon: '<path d="M3 1h10v14H3zm2 2v10h6V3z" fill-rule="evenodd"/><path d="M5 3h6v10H5z" opacity=".45"/>' },
+  shop: { label: 'Торгівля', color: '#3fe0a0', icon: '<path d="M5 1.5h6L15 6l-7 8.5L1 6z"/><path d="M1.5 6h13M8 14V6M5.5 1.8 8 6l2.5-4.2" fill="none" stroke="#04080a" stroke-width=".9" opacity=".55"/>' },
+  danger: { label: 'Небезпека', color: '#ff6f61', icon: '<path d="M8 1.2 15.2 14.5H.8z"/><path d="M7.1 5.5h1.8v4.8H7.1zM7.1 11.5h1.8v1.8H7.1z" fill="#04080a"/>' },
+  other: { label: 'Інше', color: '#22e1e3', icon: '<path d="M8 1.2l2 4.4 4.8.5-3.6 3.2 1 4.7L8 11.6 3.8 14l1-4.7L1.2 6.1 6 5.6z"/>' },
+};
+const kindOf = (m) => KINDS[m.kind] || KINDS.other;
+const kindSvg = (k) => `<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">${(KINDS[k] || KINDS.other).icon}</svg>`;
+const fmtXYZ = (m) => `X ${m.x} · ${m.y === null || m.y === undefined ? '' : `Y ${m.y} · `}Z ${m.z}`;
+
+const pins = L.layerGroup().addTo(map);
+const pinById = new Map();
+function hiddenKinds() {
+  try { return new Set(JSON.parse(store.get('hiddenKinds') || '[]')); } catch { return new Set(); }
+}
+function visibleMarkers() {
+  const hidden = hiddenKinds();
+  return state.markers.filter((m) => m.dimension === state.dim && !hidden.has(m.kind));
+}
+
+function renderPins() {
+  pins.clearLayers();
+  pinById.clear();
+  const editor = isEditor();
+  for (const m of visibleMarkers()) {
+    const k = kindOf(m);
+    const icon = L.divIcon({ className: '', html: `<div class="mark-pin" style="--c:${k.color}">${kindSvg(m.kind)}</div>`, iconSize: [26, 26] });
+    const pin = L.marker(toLatLng(m.x + 0.5, m.z + 0.5), { icon, title: m.name, draggable: editor, riseOnHover: true })
+      .bindTooltip(`<span style="--c:${k.color}">${esc(m.name)}</span>`, { permanent: true, direction: 'right', offset: [14, 0], className: 'mark-label' })
+      .bindPopup(() => pinPopup(m), { className: 'mark-popup', offset: [0, -10], maxWidth: 300 })
+      .on('dragend', (e) => movePin(m, e.target.getLatLng()))
+      .on('mouseover', () => pin.getTooltip()?.getElement()?.classList.add('hover'))
+      .on('mouseout', () => pin.getTooltip()?.getElement()?.classList.remove('hover'))
+      .addTo(pins);
+    pinById.set(m.id, pin);
+  }
+  syncLabels();
+}
+// Підписи видно, коли мапа наближена. Здалеку лишаються самі значки, щоб написи не злипались.
+function syncLabels() { map.getContainer().classList.toggle('labels-off', map.getZoom() < 1); }
+map.on('zoomend', syncLabels);
+
+function pinPopup(m) {
+  const k = kindOf(m);
+  const box = document.createElement('div');
+  box.className = 'mark-pop';
+  box.style.setProperty('--c', k.color);
+  box.innerHTML = `
+    <div class="mark-pop-head">${kindSvg(m.kind)}<b>${esc(m.name)}</b></div>
+    <div class="muted small">${k.label} · ${DIM_NAMES[m.dimension]}</div>
+    <div class="mono">${fmtXYZ(m)}</div>
+    ${m.description ? `<p>${esc(m.description)}</p>` : ''}
+    <div class="mark-pop-actions">
+      <button type="button" class="btn" data-copy>Копіювати координати</button>
+      ${isEditor() ? '<button type="button" class="btn" data-edit>Змінити</button>' : ''}
+    </div>`;
+  box.addEventListener('click', async (e) => {
+    if (e.target.closest('[data-edit]')) { map.closePopup(); openMarker(m); }
+    if (e.target.closest('[data-copy]')) {
+      const text = `${m.x} ${m.y ?? '~'} ${m.z}`;
+      try { await navigator.clipboard.writeText(text); toast(`Скопійовано: ${text}`); } catch { toast(text); }
+    }
+  });
+  return box;
+}
+
+async function movePin(m, latlng) {
+  const x = Math.floor(latlng.lng), z = Math.floor(-latlng.lat);
+  try {
+    const saved = await api('markers/' + m.id, { method: 'PATCH', json: { x, z } });
+    Object.assign(m, saved);
+    toast(`Мітку «${m.name}» переміщено: X ${x} · Z ${z}`);
+  } catch (err) {
+    toast('Не вдалося перемістити: ' + err.message);
+  }
+  renderPins();
+  renderMarkersList();
+}
+
+async function loadMarkers() {
+  state.markers = await api('markers');
+  renderPins();
+  renderKindChips();
+  renderMarkersList();
+  if (v3d.mode === '3d') markers3d();
+}
+
+// --- Список міток з пошуком: щоб швидко знайти, де що є ---
+function toggleMarkersPanel(open = $('#markersPanel').hidden) {
+  $('#markersPanel').hidden = !open;
+  $('#markersBtn').setAttribute('aria-expanded', String(open));
+  $('#markersBtn').classList.toggle('on', open);
+  if (open) { renderKindChips(); renderMarkersList(); $('#markerSearch').focus({ preventScroll: true }); }
+}
+$('#markersBtn').addEventListener('click', () => toggleMarkersPanel());
+$('#markersClose').addEventListener('click', () => toggleMarkersPanel(false));
+$('#markerSearch').addEventListener('input', renderMarkersList);
+$('#markerSearch').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') $('#markersList button')?.click();
+  if (e.key === 'Escape') toggleMarkersPanel(false);
+});
+
+function renderKindChips() {
+  const hidden = hiddenKinds();
+  const inDim = state.markers.filter((m) => m.dimension === state.dim);
+  $('#kindChips').innerHTML = Object.entries(KINDS).map(([key, k]) => {
+    const n = inDim.filter((m) => m.kind === key).length;
+    return n ? `<button type="button" class="kind-chip" data-kind="${key}" aria-pressed="${!hidden.has(key)}" style="--c:${k.color}" title="Показати або сховати: ${k.label}">${kindSvg(key)}${k.label} <span class="n">${n}</span></button>` : '';
+  }).join('');
+}
+$('#kindChips').addEventListener('click', (e) => {
+  const chip = e.target.closest('[data-kind]');
+  if (!chip) return;
+  const hidden = hiddenKinds();
+  const key = chip.dataset.kind;
+  hidden.has(key) ? hidden.delete(key) : hidden.add(key);
+  store.set('hiddenKinds', JSON.stringify([...hidden]));
+  renderKindChips();
+  renderPins();
+  renderMarkersList();
+});
+
+function renderMarkersList() {
+  const q = $('#markerSearch').value.trim().toLowerCase();
+  const list = visibleMarkers().filter((m) => !q || m.name.toLowerCase().includes(q) || (m.description || '').toLowerCase().includes(q));
+  const total = state.markers.filter((m) => m.dimension === state.dim).length;
+  $('#markersBtn').innerHTML = total ? `Мітки <span class="count">${total}</span>` : 'Мітки';
+  $('#markersList').innerHTML = list.length
+    ? list.map((m) => `<li><button type="button" data-id="${m.id}" style="--c:${kindOf(m).color}"><span class="mark-ico">${kindSvg(m.kind)}</span><span class="mark-name">${esc(m.name)}</span><span class="mono muted">${m.x} ${m.z}</span></button></li>`).join('')
+    : `<li class="muted small">${total ? 'Нічого не знайдено' : 'Міток ще немає. ' + (isEditor() ? 'Натисни «+ Мітка».' : 'Їх ставлять редактори.')}</li>`;
+}
+$('#markersList').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-id]');
+  const m = btn && state.markers.find((x) => String(x.id) === btn.dataset.id);
+  if (m) flyToMarker(m);
+});
+
+function flyToMarker(m) {
+  if (v3d.mode === '3d') setMode('2d');
+  if (m.dimension !== state.dim) setDimension(m.dimension);
+  map.setView(toLatLng(m.x + 0.5, m.z + 0.5), Math.max(map.getZoom(), 2));
+  pinById.get(m.id)?.openPopup();
+  if (window.matchMedia('(max-width: 760px)').matches) toggleMarkersPanel(false);
+}
+
+// --- Поставити мітку: «+ Мітка», потім клік по мапі ---
+let placing = false;
+function setPlacing(on) {
+  placing = on;
+  map.getContainer().classList.toggle('placing', on);
+  $('#placeHint').hidden = !on;
+  $('#addMarkerBtn').classList.toggle('on', on);
+}
+$('#addMarkerBtn').addEventListener('click', () => {
+  if (v3d.mode === '3d') setMode('2d');
+  setPlacing(!placing);
+});
+$('#placeCancel').addEventListener('click', () => setPlacing(false));
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && placing) setPlacing(false); });
+map.on('click', (e) => {
+  if (!placing) return;
+  setPlacing(false);
+  openMarker(null, { x: Math.floor(e.latlng.lng), z: Math.floor(-e.latlng.lat) });
+});
+
+// --- Діалог мітки (редактор змінює, решта лише дивиться) ---
+function renderKindOptions(f, selected) {
+  $('[data-kinds]', f).innerHTML = Object.entries(KINDS).map(([key, k]) =>
+    `<label class="kind-opt" style="--c:${k.color}"><input type="radio" name="kind" value="${key}"${key === selected ? ' checked' : ''}><span>${kindSvg(key)}${k.label}</span></label>`
+  ).join('');
+}
+function openMarker(m, prefill = {}) {
+  const f = $('#markerForm');
+  const editor = isEditor();
+  f.reset();
+  renderKindOptions(f, m?.kind || store.get('lastKind') || 'other');
+  $('[data-title]', f).textContent = m ? (editor ? 'Мітка' : m.name) : 'Нова мітка';
+  f.dataset.id = m ? m.id : '';
+  f.name.value = m?.name || '';
+  f.x.value = m ? m.x : prefill.x ?? '';
+  f.y.value = m ? m.y ?? '' : prefill.y ?? '';
+  f.z.value = m ? m.z : prefill.z ?? '';
+  f.dimension.value = m?.dimension || state.dim;
+  f.description.value = m?.description || '';
+  const when = m ? new Date(m.created_at.replace(' ', 'T') + 'Z').toLocaleDateString('uk-UA') : '';
+  $('[data-meta]', f).textContent = m ? `Додано ${when}${m.author ? ` · ${m.author}` : ''}` : '';
+  $$('input, textarea, select', f).forEach((el) => (el.disabled = !editor));
+  $('button.primary', f).hidden = !editor;
+  $('[data-delete]', f).hidden = !editor || !m;
+  openDialog('#markerDialog');
+  if (editor && !m) f.name.focus();
+}
+$('#markerForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const form = e.target;
+  withBusy(form, async () => {
+    const body = {
+      name: form.name.value, kind: form.kind.value || 'other', description: form.description.value,
+      x: form.x.value, y: form.y.value === '' ? null : form.y.value, z: form.z.value,
+      dimension: form.dimension.value,
+    };
+    if (!form.dataset.id) body.author = store.get('author') || '';
+    store.set('lastKind', body.kind);
+    const saved = form.dataset.id
+      ? await api('markers/' + form.dataset.id, { method: 'PATCH', json: body })
+      : await api('markers', { method: 'POST', json: body });
+    form.closest('dialog').close();
+    await loadMarkers();
+    toast(`Мітку «${saved.name}» збережено`);
+    if (saved.dimension !== state.dim) setDimension(saved.dimension);
+    pinById.get(saved.id)?.openPopup();
+  });
+});
+$('#markerForm [data-delete]').addEventListener('click', async () => {
+  const form = $('#markerForm');
+  const m = state.markers.find((x) => String(x.id) === form.dataset.id);
+  if (!m || !confirm(`Видалити мітку «${m.name}»?`)) return;
+  try {
+    await api('markers/' + m.id, { method: 'DELETE' });
+    form.closest('dialog').close();
+    await loadMarkers();
+    toast('Мітку видалено');
+  } catch (err) { showError(form, err.message); }
 });
 
 function setDimension(dim) {
@@ -234,6 +476,9 @@ function setDimension(dim) {
   $('#dimSelect').value = dim;
   renderCityMap();
   renderMarkers();
+  renderPins();
+  renderKindChips();
+  renderMarkersList();
   updateBluemapButton();
 }
 $('#dimSelect').addEventListener('change', (e) => setDimension(e.target.value));
@@ -335,11 +580,19 @@ function markers3d() {
   const layer = v3d.layer;
   if (!v3d.viewer || !layer?.model || !v3d.schem) return;
   const { width: W, height: H, length: L } = v3d.schem;
-  const list = state.schematics
-    .filter((s) => s.dimension === layer.dimension)
-    .map((s) => ({ id: s.id, label: s.name, x: s.x - layer.originX, y: s.y - layer.model.minY, z: s.z - layer.originZ }))
-    .filter((m) => m.x > -16 && m.z > -16 && m.x < W + 16 && m.z < L + 16 && m.y > -16 && m.y < H + 16);
-  v3d.viewer.setMarkers(list, openSchematic);
+  const at = (o) => ({ x: o.x - layer.originX, y: o.y - layer.model.minY, z: o.z - layer.originZ });
+  const list = [
+    ...state.schematics.filter((s) => s.dimension === layer.dimension)
+      .map((s) => ({ id: 's' + s.id, label: s.name, ...at(s) })),
+    // Мітки без Y у 3D не показуємо: невідомо, на якій висоті їх ставити.
+    ...state.markers.filter((m) => m.dimension === layer.dimension && m.y !== null)
+      .map((m) => ({ id: 'm' + m.id, label: m.name, color: kindOf(m).color, ...at(m) })),
+  ].filter((m) => m.x > -16 && m.z > -16 && m.x < W + 16 && m.z < L + 16 && m.y > -16 && m.y < H + 16);
+  v3d.viewer.setMarkers(list, (id) => {
+    if (id.startsWith('s')) return openSchematic(id.slice(1));
+    const m = state.markers.find((x) => 'm' + x.id === id);
+    if (m) openMarker(m);
+  });
 }
 
 function fitCity() {
@@ -912,7 +1165,7 @@ async function loadTasks() {
     try { await api('auth', { method: 'POST' }); setEditor(true); } catch { setEditor(false); }
   }
   try {
-    await Promise.all([loadLayers(), loadSchematics(), loadTasks()]);
+    await Promise.all([loadLayers(), loadSchematics(), loadTasks(), loadMarkers()]);
     renderCityMap();
     fitCity();
     updateBluemapButton();

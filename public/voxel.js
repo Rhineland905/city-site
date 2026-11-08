@@ -267,10 +267,11 @@ export function createViewer(container, { fog = true } = {}) {
       markers = list.map((m) => {
         const g = new THREE.Group();
         g.position.set(m.x + 0.5, m.y + 0.5, m.z + 0.5);
-        const core = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.9, 0.9), new THREE.MeshBasicMaterial({ color: 0x22e1e3 }));
+        const color = m.color || 0x22e1e3; // мітки мають колір свого типу
+        const core = new THREE.Mesh(new THREE.BoxGeometry(0.9, 0.9, 0.9), new THREE.MeshBasicMaterial({ color }));
         const beam = new THREE.Mesh(
           new THREE.BoxGeometry(0.18, 10, 0.18),
-          new THREE.MeshBasicMaterial({ color: 0x22e1e3, transparent: true, opacity: 0.35, blending: THREE.AdditiveBlending, depthWrite: false })
+          new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.35, blending: THREE.AdditiveBlending, depthWrite: false })
         );
         beam.position.y = 5;
         const hit = new THREE.Mesh(new THREE.BoxGeometry(2.4, 12, 2.4), new THREE.MeshBasicMaterial({ visible: false }));
@@ -282,6 +283,7 @@ export function createViewer(container, { fog = true } = {}) {
         label.type = 'button';
         label.className = 'v3d-label';
         label.textContent = m.label;
+        if (m.color) label.style.color = m.color;
         label.addEventListener('click', () => onPick?.(m.id));
         overlay.appendChild(label);
         return { ...m, group: g, core, hit, label };
