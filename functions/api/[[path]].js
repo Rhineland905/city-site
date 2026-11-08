@@ -93,6 +93,18 @@ function ensureSchema(env) {
         await saveLayers(env, layers.map((l) => ({ ...l, name: names[l.name] || l.name })));
       }
     }
+    // Шар міста спершу поставили за прикидкою (кут X −1426, Z −418). Насправді центр міста на X 4250, Z 1550,
+    // тож один раз пересуваємо такий шар: центр головного залу схематика (156, 152) лягає на ці координати.
+    const moved = await env.DB.prepare(
+      "INSERT INTO settings (key, value) VALUES ('city_moved', '1') ON CONFLICT(key) DO NOTHING"
+    ).run();
+    if (moved.meta.changes === 1) {
+      const layers = await getLayers(env);
+      const guessed = (l) => l.originX === -1426 && l.originZ === -418;
+      if (layers.some(guessed)) {
+        await saveLayers(env, layers.map((l) => (guessed(l) ? { ...l, originX: 4094, originZ: 1398 } : l)));
+      }
+    }
   })().catch((e) => { schemaReady = null; throw e; });
   return schemaReady;
 }
