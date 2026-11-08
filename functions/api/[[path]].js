@@ -384,7 +384,7 @@ async function markerImages(request, env, method, id, imageId) {
   const markerId = Number(id);
   if (!Number.isInteger(markerId)) return fail(404, 'Мітку не знайдено');
   if (imageId !== undefined && !/^[0-9a-f]{12}$/.test(imageId)) return fail(404, 'Картинку не знайдено');
-  if (method === 'GET' && imageId) {
+  if ((method === 'GET' || method === 'HEAD') && imageId) {
     const thumb = new URL(request.url).searchParams.has('t');
     let { value, metadata } = await env.FILES.getWithMetadata(`mimg:${markerId}:${imageId}${thumb ? ':t' : ''}`, 'arrayBuffer');
     if (!value && thumb) ({ value, metadata } = await env.FILES.getWithMetadata(`mimg:${markerId}:${imageId}`, 'arrayBuffer'));
