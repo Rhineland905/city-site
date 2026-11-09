@@ -350,10 +350,16 @@ function canvas(w, h) {
   return c;
 }
 
+// Посилання «#line» → «block/redstone_dust_dot». З 1.21.5 текстура в моделі буває й об’єктом
+// { sprite, force_translucent }.
 function resolveTex(textures, ref) {
   let r = ref;
-  for (let i = 0; i < 12 && r && r.startsWith('#'); i++) r = textures[r.slice(1)];
-  return r && !r.startsWith('#') ? r : null;
+  for (let i = 0; i < 12 && r; i++) {
+    if (typeof r === 'object') r = r.sprite;
+    else if (typeof r === 'string' && r.startsWith('#')) r = textures[r.slice(1)];
+    else break;
+  }
+  return typeof r === 'string' && r && !r.startsWith('#') ? r : null;
 }
 
 // Малює текстуру на чотирикутник грані (афінно, без згладжування, щоб пікселі лишались чіткими).
@@ -725,3 +731,305 @@ export function blockColors(schem, tiles) {
   for (const [name, { t }] of best) out[name] = [hex(t.top), hex(t.side || t.top)];
   return out;
 }
+
+// ---------- Блоки для 3D ----------
+// Кожен стан блока стає набором чотирикутників у клітинці 1×1×1 за справжньою моделлю з гри.
+// Текстури лягають в атлас — стос однакових квадратів, по шару на текстуру, — тож у 3D кожна
+// грань бере свій шар і сусідні текстури не протікають одна в одну.
+//
+// Чотирикутник — QUAD чисел: [0..11] кути (x, y, z) проти годинникової стрілки, якщо дивитися ззовні,
+// [12..19] uv кутів (0…1), [20] шар атласу, [21] сторона, з якої його закриває сусід (0…5 або -1),
+// [22] яскравість грані, [23] вид: 0 непрозорий, 1 з дірками (листя, скло), 2 напівпрозорий (вода, лід).
+export const QUAD = 24;
+export const DIRS = [[0, 1, 0], [0, -1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]]; // up down north south west east
+const DIR_NAMES = ['up', 'down', 'north', 'south', 'west', 'east'];
+
+function dirIndex(v) {
+  const ax = Math.abs(v[0]), ay = Math.abs(v[1]), az = Math.abs(v[2]);
+  if (ay >= ax && ay >= az) return v[1] > 0 ? 0 : 1;
+  if (az >= ax) return v[2] < 0 ? 2 : 3;
+  return v[0] < 0 ? 4 : 5;
+}
+// Сторона після повороту моделі зі стану блока.
+const rotDir = (name, rx, ry) => {
+  const d = DIRS[DIR_NAMES.indexOf(name)];
+  if (!d) return -1;
+  const p = rotateState([8 + d[0] * 8, 8 + d[1] * 8, 8 + d[2] * 8], rx, ry);
+  return dirIndex([p[0] - 8, p[1] - 8, p[2] - 8]);
+};
+// Світло на гранях, як у грі: верх яскравий, боки темніші, низ найтемніший.
+const diffuse = (n) => Math.min(1, n[0] * n[0] * 0.6 + n[1] * n[1] * ((3 + n[1]) / 4) + n[2] * n[2] * 0.8);
+
+// uv для «uvlock»: текстура лежить за світовою сіткою, хоч модель і повернута.
+const LOCKED_UV = [
+  (p) => [p[0], p[2]], (p) => [p[0], 16 - p[2]], (p) => [16 - p[0], 16 - p[1]],
+  (p) => [p[0], 16 - p[1]], (p) => [p[2], 16 - p[1]], (p) => [16 - p[2], 16 - p[1]],
+];
+
+function alphaKind(c) {
+  const d = c.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, c.width, c.height).data;
+  let clear = 0, semi = 0;
+  for (let i = 3; i < d.length; i += 4) {
+    if (d[i] === 0) clear++;
+    else if (d[i] < 255) semi++;
+  }
+  return semi > (d.length / 4) * 0.15 ? 2 : clear + semi ? 1 : 0;
+}
+
+class Atlas {
+  constructor(assets) { this.assets = assets; this.index = new Map(); this.list = []; }
+  add(key, make) {
+    let p = this.index.get(key);
+    if (!p) {
+      p = Promise.resolve().then(make).then((c) => {
+        if (!c) return -1;
+        this.list.push({ canvas: c, kind: alphaKind(c) });
+        return this.list.length - 1;
+      }).catch(() => -1);
+      this.index.set(key, p);
+    }
+    return p;
+  }
+  texture(ref, tint) { return this.add(`${ref}|${tint ?? ''}`, () => this.assets.tinted(ref, tint)); }
+  kind(layer) { return layer >= 0 ? this.list[layer].kind : 0; }
+  // Усі шари одного розміру (як у найбільшої текстури, до 64 пікселів) в одному масиві RGBA.
+  pack() {
+    const size = Math.min(64, Math.max(16, ...this.list.map((t) => t.canvas.width)));
+    const data = new Uint8Array(size * size * 4 * Math.max(1, this.list.length));
+    const c = canvas(size, size);
+    const g = c.getContext('2d', { willReadFrequently: true });
+    g.imageSmoothingEnabled = false;
+    this.list.forEach((t, i) => {
+      g.clearRect(0, 0, size, size);
+      g.drawImage(t.canvas, 0, 0, size, size);
+      const d = g.getImageData(0, 0, size, size).data;
+      // Прозорим пікселям даємо середній колір текстури: здалеку (на зменшених копіях) листя
+      // й квіти тоді не обростають чорною облямівкою.
+      let r = 0, gg = 0, b = 0, n = 0;
+      for (let k = 0; k < d.length; k += 4) if (d[k + 3]) { r += d[k]; gg += d[k + 1]; b += d[k + 2]; n++; }
+      if (n && n < d.length / 4) {
+        for (let k = 0; k < d.length; k += 4) if (!d[k + 3]) { d[k] = r / n; d[k + 1] = gg / n; d[k + 2] = b / n; }
+      }
+      data.set(d, i * size * size * 4);
+    });
+    return { size, count: Math.max(1, this.list.length), data };
+  }
+}
+
+// Грань елемента моделі. pts — кути в порядку кутів текстури (верх-ліво, верх-право, низ-право, низ-ліво),
+// а WebGL хоче обхід проти годинникової стрілки ззовні, тому пишемо 0, 3, 2, 1.
+function pushQuad(out, pts, uvc, layer, cull, shade, kind) {
+  for (const i of [0, 3, 2, 1]) out.push(pts[i][0] / 16, pts[i][1] / 16, pts[i][2] / 16);
+  for (const i of [0, 3, 2, 1]) out.push(uvc[i][0] / 16, uvc[i][1] / 16);
+  out.push(layer, cull, shade, kind);
+}
+
+// Елемент (коробка з гранями) → чотирикутники. layerOf(face) дає шар атласу для грані.
+async function addElement(out, atlas, el, layerOf, rx = 0, ry = 0, uvlock = false) {
+  if (!el.faces || !el.from || !el.to) return;
+  const glow = (Number(el.light_emission) || 0) / 15;
+  for (const [dir, face] of Object.entries(el.faces)) {
+    let pts = faceCorners(dir, el.from, el.to);
+    if (!pts) continue;
+    const layer = await layerOf(face);
+    if (layer < 0) continue;
+    pts = pts.map((p) => rotateState(rotateElement(p, el.rotation), rx, ry));
+    const n = cross(sub(pts[3], pts[0]), sub(pts[1], pts[0]));
+    const len = Math.hypot(n[0], n[1], n[2]);
+    if (len < 1e-6) continue;
+    const nn = [n[0] / len, n[1] / len, n[2] / len];
+    let uvc;
+    if (uvlock && (rx || ry)) {
+      uvc = pts.map(LOCKED_UV[dirIndex(nn)]);
+    } else {
+      const uv = face.uv || defaultUv(dir, el.from, el.to);
+      uvc = [[uv[0], uv[1]], [uv[2], uv[1]], [uv[2], uv[3]], [uv[0], uv[3]]];
+      const k = ((Number(face.rotation) || 0) / 90) & 3;
+      if (k) uvc = uvc.map((_, i) => uvc[(i - k + 4) % 4]);
+    }
+    // Нові версії замість «shade: false» кажуть, як світити грань: «up» — як верх, тобто без тіні.
+    const over = DIRS[DIR_NAMES.indexOf(el.shade_direction_override)];
+    const shade = Math.max(over ? diffuse(over) : el.shade === false ? 1 : diffuse(nn), glow);
+    pushQuad(out, pts, uvc, layer, face.cullface ? rotDir(face.cullface, rx, ry) : -1, shade, atlas.kind(layer));
+  }
+}
+
+// Які сторони клітинки модель закриває цілком: непрозорими гранями (такий блок ховає грані сусідів)
+// і будь-якими (так скло біля скла не малює стінку між собою).
+function shapeOf(q) {
+  let solid = 0, full = 0;
+  for (let o = 0; o < q.length; o += QUAD) {
+    const cull = q[o + 21];
+    if (cull < 0) continue;
+    const [a, b] = cull < 2 ? [0, 2] : cull < 4 ? [0, 1] : [1, 2];
+    let lo = 1, hi = 0, lo2 = 1, hi2 = 0;
+    for (let k = 0; k < 4; k++) {
+      const u = q[o + k * 3 + a], v = q[o + k * 3 + b];
+      lo = Math.min(lo, u); hi = Math.max(hi, u); lo2 = Math.min(lo2, v); hi2 = Math.max(hi2, v);
+    }
+    if (lo > 0.001 || lo2 > 0.001 || hi < 0.999 || hi2 < 0.999) continue;
+    full |= 1 << cull;
+    if (q[o + 23] === 0) solid |= 1 << cull;
+  }
+  return { solid, full };
+}
+
+// Скриня малюється грою окремо, без моделі блока: складаємо її з частин текстури entity/chest.
+// Частини лежать у текстурі догори дриґом, тому бокові смужки повертаємо на 180°.
+const CHEST_PARTS = [
+  // [from, to, { сторона: [u, v, w, h, спосіб] }] у пікселях текстури 64×64; спосіб: r — поворот на 180°, f — віддзеркалити по вертикалі
+  [[1, 0, 1], [15, 10, 15], { down: [14, 19, 14, 14, 'r'], north: [14, 33, 14, 10, 'r'], south: [42, 33, 14, 10, 'r'], west: [0, 33, 14, 10, 'r'], east: [28, 33, 14, 10, 'r'] }],
+  [[1, 9, 1], [15, 14, 15], { up: [28, 0, 14, 14, 'f'], north: [14, 14, 14, 5, 'r'], south: [42, 14, 14, 5, 'r'], west: [0, 14, 14, 5, 'r'], east: [28, 14, 14, 5, 'r'] }],
+  [[7, 7, 15], [9, 11, 16], { up: [3, 0, 2, 1, 'f'], down: [1, 0, 2, 1, 'r'], south: [4, 1, 2, 4, 'r'], west: [0, 1, 1, 4, 'r'], east: [3, 1, 1, 4, 'r'] }],
+];
+const CHEST = /^minecraft:(?:waxed_)?(trapped_chest|ender_chest|chest|copper_chest|exposed_copper_chest|weathered_copper_chest|oxidized_copper_chest)$/;
+async function chestQuads(atlas, name, props) {
+  const variant = {
+    chest: 'normal', trapped_chest: 'trapped', ender_chest: 'ender', copper_chest: 'copper',
+    exposed_copper_chest: 'copper_exposed', weathered_copper_chest: 'copper_weathered', oxidized_copper_chest: 'copper_oxidized',
+  }[CHEST.exec(name)[1]];
+  const tex = await atlas.assets.texture(`minecraft:entity/chest/${variant}`) || await atlas.assets.texture('minecraft:entity/chest/normal');
+  if (!tex) return null;
+  const s = tex.width / 64;
+  // Подвійна скриня: половинки тягнемо до сусідки, щоб між ними не було щілини.
+  const grow = props.type === 'left' ? [0, 1] : props.type === 'right' ? [-1, 0] : [0, 0];
+  const parts = CHEST_PARTS.map(([f, t, faces], i) => [i < 2 ? [f[0] + grow[0], f[1], f[2]] : f, i < 2 ? [t[0] + grow[1], t[1], t[2]] : t, faces]);
+  // Шар на кожну сторону: частини текстури лягають туди, куди на цю сторону дивиться стандартна uv-розгортка.
+  const layers = {};
+  for (const dir of DIR_NAMES) {
+    layers[dir] = await atlas.add(`chest:${variant}:${props.type || ''}:${dir}`, () => {
+      const c = canvas(16 * s, 16 * s);
+      const g = c.getContext('2d');
+      g.imageSmoothingEnabled = false;
+      let any = false;
+      for (const [from, to, faces] of parts) {
+        const src = faces[dir];
+        if (!src) continue;
+        const [u0, v0, u1, v1] = defaultUv(dir, from, to);
+        const [sx, sy, sw, sh, how] = src;
+        g.save();
+        if (how === 'r') { g.translate(u1 * s, v1 * s); g.rotate(Math.PI); } else { g.translate(u0 * s, v1 * s); g.scale(1, -1); }
+        g.drawImage(tex, sx * s, sy * s, sw * s, sh * s, 0, 0, (u1 - u0) * s, (v1 - v0) * s);
+        g.restore();
+        any = true;
+      }
+      return any ? c : null;
+    });
+  }
+  const ry = { south: 0, west: 90, north: 180, east: 270 }[props.facing] || 0;
+  const q = [];
+  for (const [from, to, faces] of parts) {
+    const el = { from, to, faces: Object.fromEntries(Object.keys(faces).map((d) => [d, { dir: d }])) };
+    await addElement(q, atlas, el, (face) => layers[face.dir], 0, ry);
+  }
+  return q;
+}
+
+// Вода й лава: куб текстури «still»; верх рідини опускається до 14/16, якщо над нею не та сама рідина.
+async function fluidQuads(atlas, short, top) {
+  const lava = short === 'lava';
+  const layer = await atlas.texture(lava ? 'minecraft:block/lava_still' : 'minecraft:block/water_still', lava ? undefined : 0x3f76e4);
+  if (layer < 0) return null;
+  const faces = Object.fromEntries(DIR_NAMES.map((d) => [d, { cullface: d }]));
+  const q = [];
+  await addElement(q, atlas, { from: [0, 0, 0], to: [16, top, 16], faces }, () => layer);
+  if (top < 16) { // верх не прилягає до сусіда, тож його не закриває навіть такий самий блок
+    for (let o = 0; o < q.length; o += QUAD) if (q[o + 21] === 0) q[o + 21] = -1;
+  }
+  return q;
+}
+
+// Таблички, прапори й голови гра малює окремо від моделей блоків (голова поршня — звичайна модель).
+const NO_3D = /^minecraft:(?!piston_head$)(\w+_)?(sign|wall_sign|hanging_sign|wall_hanging_sign|banner|wall_banner|head|wall_head|skull|wall_skull)$|^minecraft:(conduit|end_portal|end_gateway|moving_piston|bubble_column_top)$/;
+
+// Один стан блока → { variants: [Float32Array...], solid, full, group } або null, якщо в 3D його не малюємо.
+async function bakeState(atlas, state) {
+  const assets = atlas.assets;
+  const { name, props } = parseState(state);
+  if (EMPTY.test(name) || NO_3D.test(name)) return null;
+  const short = name.replace(/^minecraft:/, '');
+  const done = (variants, extra = {}) => {
+    const list = variants.filter((v) => v && v.length).map((v) => Float32Array.from(v));
+    if (!list.length) return null;
+    const { solid, full } = shapeOf(list[0]);
+    return { variants: list, solid: solid === 63, full: full === 63, solidMask: solid, group: name, ...extra };
+  };
+
+  if (/^(water|bubble_column|lava)$/.test(short)) {
+    const group = short === 'lava' ? 'minecraft:lava' : 'minecraft:water';
+    return done([await fluidQuads(atlas, short, 16)], { group, surface: Float32Array.from(await fluidQuads(atlas, short, 14) || []) });
+  }
+  if (CHEST.test(name)) return done([await chestQuads(atlas, name, props)]);
+
+  const sets = await modelSets(assets, state);
+  const tint = tintFor(name, props);
+  const variants = [];
+  for (const set of sets || []) {
+    const q = [];
+    let particle = null;
+    for (const apply of set) {
+      if (!apply || !apply.model) continue;
+      const model = await assets.model(apply.model);
+      particle ||= resolveTex(model.textures, '#particle');
+      const rx = Number(apply.x) || 0, ry = Number(apply.y) || 0;
+      for (const el of model.elements) {
+        await addElement(q, atlas, el, (face) => {
+          const ref = resolveTex(model.textures, face.texture);
+          return ref ? atlas.texture(ref, face.tintindex !== undefined ? tint : undefined) : -1;
+        }, rx, ry, !!apply.uvlock);
+      }
+    }
+    // Модель без геометрії (її малює гра окремо, як шалкерову скриню): куб із текстурою частинок.
+    if (!q.length && particle) {
+      const layer = await atlas.texture(particle);
+      if (layer >= 0) await addElement(q, atlas, { from: [0, 0, 0], to: [16, 16, 16], faces: Object.fromEntries(DIR_NAMES.map((d) => [d, { cullface: d }])) }, () => layer);
+    }
+    variants.push(q);
+  }
+  const baked = done(variants);
+  if (baked) return baked;
+  // Блока немає у файлі гри (наприклад, із мода): кольоровий куб.
+  const layer = await atlas.add('#color|' + name, () => colorTile(name).tiles[0]);
+  const q = [];
+  await addElement(q, atlas, { from: [0, 0, 0], to: [16, 16, 16], faces: Object.fromEntries(DIR_NAMES.map((d) => [d, { cullface: d }])) }, () => layer);
+  return done([q], { missing: true });
+}
+
+// Моделі всіх станів схематика для 3D і атлас їхніх текстур. onProgress(done, total) для рядка стану.
+export async function bakeBlocks(assets, states, onProgress) {
+  const atlas = new Atlas(assets);
+  const blocks = new Array(states.length).fill(null);
+  for (let i = 0; i < states.length; i++) {
+    try {
+      blocks[i] = await bakeState(atlas, states[i] || 'minecraft:air');
+    } catch (e) {
+      console.warn('Блок для 3D', states[i], e);
+    }
+    if (onProgress && (i % 16 === 0 || i === states.length - 1)) {
+      onProgress(i + 1, states.length);
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+  return { blocks, atlas: atlas.pack() };
+}
+
+// ---------- Файли гри запам’ятовуються в цьому браузері ----------
+// Браузер не дає сайту знову відкрити файл за шляхом, тож вибраний .jar кладемо в IndexedDB
+// цього браузера. Звідти він нікуди не йде, а наступного разу 3D одразу буде з текстурами.
+function idb(mode, fn) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open('city-site', 1);
+    open.onupgradeneeded = () => open.result.createObjectStore('packs');
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const tx = db.transaction('packs', mode);
+      const req = fn(tx.objectStore('packs'));
+      tx.oncomplete = () => { db.close(); resolve(req.result); };
+      tx.onerror = tx.onabort = () => { db.close(); reject(tx.error); };
+    };
+  });
+}
+export const rememberPacks = (files) => idb('readwrite', (s) => s.put([...files], 'textures')).catch((e) => console.warn('Текстури не запам’яталися:', e));
+export const rememberedPacks = () => idb('readonly', (s) => s.get('textures')).catch(() => null);
+export const forgetPacks = () => idb('readwrite', (s) => s.delete('textures')).catch(() => {});
