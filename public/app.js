@@ -1,4 +1,5 @@
 import { parseSchematic, renderTopDown, naturalShare, suggestSlice } from './schem.js';
+import { isAir, isNatural } from './blocks.js';
 import { CONFIG } from './config.js';
 
 const $ = (s, el = document) => el.querySelector(s);
@@ -409,6 +410,11 @@ $('#markersList').addEventListener('click', (e) => {
 });
 
 function flyToMarker(m) {
+  // У 3D камера летить до мітки, якщо вона є в 3D; інакше показуємо її на 2D-мапі.
+  if (v3d.mode === '3d' && v3d.viewer?.focus('m' + m.id)) {
+    if (window.matchMedia('(max-width: 760px)').matches) toggleMarkersPanel(false);
+    return;
+  }
   if (v3d.mode === '3d') setMode('2d');
   if (m.dimension !== state.dim) setDimension(m.dimension);
   map.setView(toLatLng(m.x + 0.5, m.z + 0.5), Math.max(map.getZoom(), 2));
@@ -770,8 +776,9 @@ map.on('zoomend', syncLiveSmoothing);
 syncLiveSmoothing();
 
 // Вмикає живий шар для поточного шару мапи (або прибирає, якщо там жива мапа вимкнена).
+// У 3D він теж лишається ввімкненим: вікно «Жива мапа» показує правду, а чанки з гри вже чекають у 2D.
 function syncLive() {
-  const layer = v3d.mode === '3d' ? null : currentLayer();
+  const layer = currentLayer();
   const id = layer?.live ? layer.id : null;
   if (id !== live.layerId) {
     live.layerId = id;
@@ -936,7 +943,8 @@ function renderLiveStatus() {
     const areas = n ? ` Мод оновлює ще ${n} ${areasWord(n)} поза мапою або з іншим зрізом.` : '';
     el.innerHTML = (latest
       ? `Шар «${esc(layer.name)}»: <b>${live.tiles.size} ${chunksWord(live.tiles.size)}</b> з гри, востаннє ${ago(latest.at)}${latest.player ? ` (${esc(latest.player)})` : ''}.`
-      : `Шар «${esc(layer.name)}» чекає на перші чанки з гри. Зріз: Y від ${layer.live.top} до ${layer.live.bottom}.`) + areas;
+      : `Шар «${esc(layer.name)}» чекає на перші чанки з гри. Зріз: Y від ${layer.live.top} до ${layer.live.bottom}.`) + areas
+      + (v3d.mode === '3d' ? ' У 3D місто збудоване зі схематика, а свіжі чанки з гри видно на 2D-мапі.' : '');
   } else if (anyLive) {
     el.textContent = 'На цьому шарі жива мапа вимкнена. Вибери шар, де вона ввімкнена.';
   } else {
@@ -1482,7 +1490,10 @@ function applyClip() {
   const clip = $('#v3dClip');
   const y = Number(clip.value);
   $('#v3dClipVal').textContent = y >= Number(clip.max) ? 'усе місто' : 'Y ' + y;
-  if (v3d.viewer && v3d.layer?.model) v3d.viewer.setClip(y - v3d.layer.model.minY + 1);
+  if (v3d.viewer && v3d.layer?.model) {
+    v3d.viewer.setClip(y - v3d.layer.model.minY + 1);
+    standMarkers();
+  }
 }
 $('#v3dClip').addEventListener('input', applyClip);
 $('#v3dRock').addEventListener('change', () => {
@@ -1491,19 +1502,68 @@ $('#v3dRock').addEventListener('change', () => {
   setTimeout(() => { build3d(true); v3dStatus(''); }, 30);
 });
 
+// Мітки в 3D. Мітка без Y (або з Y поза моделлю) стоїть на верхньому видимому блоці свого стовпця
+// в межах зрізу, з яким видно 2D-мапу, і не вище повзунка висоти: там само, де її видно на 2D.
+const MARK_PAD = 64; // мітки трохи за межами схематика теж показуємо
+// Верх зрізу в цьому стовпці, як у мода: найменша область, що його містить (при рівних — пізніша), інакше шар.
+function sliceTopAt(layer, wx, wz) {
+  let best = null, bestSize = Infinity;
+  for (const r of (layer.live && layer.liveAreas) || []) {
+    if (wx < r.minX || wx > r.maxX || wz < r.minZ || wz > r.maxZ) continue;
+    const size = (r.maxX - r.minX + 1) * (r.maxZ - r.minZ + 1);
+    if (size <= bestSize) { best = r; bestSize = size; }
+  }
+  return best?.top ?? layer.live?.top ?? layer.model.sliceTop;
+}
+function standY(layer, wx, wz) {
+  const { width: W, height: H, length: L, blocks, palette } = v3d.schem;
+  const minY = layer.model.minY;
+  const x = Math.min(W - 1, Math.max(0, Math.floor(wx - layer.originX)));
+  const z = Math.min(L - 1, Math.max(0, Math.floor(wz - layer.originZ)));
+  const top = sliceTopAt(layer, wx, wz);
+  const clip = Number($('#v3dClip').value);
+  const start = Math.max(0, Math.min(H - 1,
+    Number.isFinite(clip) ? clip - minY : H - 1, Number.isFinite(top) ? top - minY : H - 1));
+  const hide = $('#v3dRock').checked;
+  for (let y = start; y >= 0; y--) {
+    const n = palette[blocks[x + z * W + y * W * L]];
+    if (!isAir(n) && !(hide && isNatural(n))) return y + 1;
+  }
+  return start; // у стовпці нічого не видно: мітка висить на рівні зрізу
+}
+// Мітки без Y опускаються за повзунком висоти й за прихованою породою.
+function standMarkers() {
+  const layer = v3d.layer;
+  if (!v3d.viewer || !v3d.schem || !layer?.model) return;
+  v3d.viewer.moveMarkers((m) => m.stand && standY(layer, m.stand[0], m.stand[1]));
+}
+
 function markers3d() {
   const layer = v3d.layer;
   if (!v3d.viewer || !layer?.model || !v3d.schem) return;
   const { width: W, height: H, length: L } = v3d.schem;
-  const at = (o) => ({ x: o.x - layer.originX, y: o.y - layer.model.minY, z: o.z - layer.originZ });
+  const near = (o) => o.x >= layer.originX - MARK_PAD && o.z >= layer.originZ - MARK_PAD
+    && o.x < layer.originX + W + MARK_PAD && o.z < layer.originZ + L + MARK_PAD;
+  const place = (o, m) => {
+    const y = o.y == null ? null : o.y - layer.model.minY;
+    const fits = y !== null && y > -16 && y < H + 16;
+    return {
+      ...m, x: o.x - layer.originX, z: o.z - layer.originZ,
+      y: fits ? y : standY(layer, o.x, o.z),
+      stand: fits ? null : [o.x, o.z],
+      label: fits || y === null ? m.label : `${m.label} · Y ${o.y}`, // справжня висота далеко від міста
+    };
+  };
+  const center = CONFIG.center && layer.dimension === 'overworld' && near(CONFIG.center) ? CONFIG.center : null;
   const list = [
-    ...state.schematics.filter((s) => s.dimension === layer.dimension)
-      .map((s) => ({ id: 's' + s.id, label: s.name, ...at(s) })),
-    // Мітки без Y у 3D не показуємо: невідомо, на якій висоті їх ставити.
-    ...state.markers.filter((m) => m.dimension === layer.dimension && m.y !== null)
-      .map((m) => ({ id: 'm' + m.id, label: m.name, color: kindOf(m).color, ...at(m) })),
-  ].filter((m) => m.x > -16 && m.z > -16 && m.x < W + 16 && m.z < L + 16 && m.y > -16 && m.y < H + 16);
+    ...(center ? [place(center, { id: 'c', label: 'Центр міста' })] : []),
+    ...state.schematics.filter((s) => s.dimension === layer.dimension && near(s))
+      .map((s) => place(s, { id: 's' + s.id, label: s.name })),
+    ...state.markers.filter((m) => m.dimension === layer.dimension && near(m))
+      .map((m) => place(m, { id: 'm' + m.id, label: m.name, color: kindOf(m).color })),
+  ];
   v3d.viewer.setMarkers(list, (id) => {
+    if (id === 'c') return toast(`Центр міста: X ${center.x} · Y ${center.y} · Z ${center.z}`);
     if (id.startsWith('s')) return openSchematic(id.slice(1));
     const m = state.markers.find((x) => 'm' + x.id === id);
     if (m) openMarker(m);

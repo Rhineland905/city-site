@@ -392,6 +392,11 @@ fieldset:disabled { opacity: .45; }
   text-shadow: 0 0 8px rgba(34, 225, 227, .5);
 }
 .v3d-label:hover { border-color: var(--soul); }
+.v3d-label.focus { animation: label-focus 2.4s ease-out; z-index: 1; }
+@keyframes label-focus {
+  0%, 30% { border-color: currentColor; box-shadow: 0 0 0 3px rgba(34, 225, 227, .35), 0 0 18px currentColor; }
+  100% { box-shadow: none; }
+}
 .preview { position: relative; }
 .preview .v3d-labels { display: none; }
 

@@ -401,6 +401,8 @@ export function createViewer(container, { fog = true } = {}) {
   const controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
   controls.screenSpacePanning = true;
+  let fly = null; // плавний переліт камери до мітки
+  controls.addEventListener('start', () => { fly = null; });
   const clipPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), 1e6);
 
   let model = null;
@@ -418,6 +420,7 @@ export function createViewer(container, { fog = true } = {}) {
   };
   const markerGroup = new THREE.Group();
   scene.add(markerGroup);
+  document.fonts?.ready.then(() => markers.forEach((m) => { m.lw = 0; })); // піксельний шрифт ширший за запасний
   let onPick = null;
 
   function frame(size) {
@@ -443,6 +446,28 @@ export function createViewer(container, { fog = true } = {}) {
     },
     // Всё, что выше этой высоты (в координатах модели), скрывается.
     setClip(y) { clipPlane.constant = y; },
+    // Нова висота міток (fn повертає y або null, щоб лишити як є).
+    moveMarkers(fn) {
+      for (const m of markers) {
+        const y = fn(m);
+        if (y == null || y === m.y) continue;
+        m.y = y;
+        m.group.position.y = y + 0.5;
+      }
+    },
+    // Камера летить до мітки, напрям погляду лишається тим самим. false, якщо такої мітки немає.
+    focus(id) {
+      const m = markers.find((k) => k.id === id);
+      if (!m) return false;
+      const to = m.group.position.clone();
+      const off = camera.position.clone().sub(controls.target);
+      off.setLength(Math.min(off.length(), 48));
+      fly = { t0: performance.now(), a: controls.target.clone(), b: to, ca: camera.position.clone(), cb: to.clone().add(off) };
+      m.label.classList.remove('focus');
+      void m.label.offsetWidth; // щоб анімація почалася знову
+      m.label.classList.add('focus');
+      return true;
+    },
     setMarkers(list, pick) {
       onPick = pick;
       markerGroup.children.slice().forEach((m) => { markerGroup.remove(m); disposeGroup(m); });
@@ -518,18 +543,40 @@ export function createViewer(container, { fog = true } = {}) {
   const loop = (t) => {
     if (!alive) return;
     if (!container.clientWidth) { raf = requestAnimationFrame(loop); return; } // вкладка скрыта
+    if (fly) {
+      const k = Math.min(1, Math.max(0, (performance.now() - fly.t0) / 700));
+      const e = k < 0.5 ? 2 * k * k : 1 - (-2 * k + 2) ** 2 / 2;
+      controls.target.lerpVectors(fly.a, fly.b, e);
+      camera.position.lerpVectors(fly.ca, fly.cb, e);
+      if (k === 1) fly = null;
+    }
     controls.update();
     // Метки пульсируют, как сердце вардена.
     const beat = 1 + 0.25 * Math.max(0, Math.sin(t / 180)) * Math.max(0, Math.sin(t / 900));
     const w = container.clientWidth, h = container.clientHeight;
+    const shown = [];
     for (const m of markers) {
       m.core.scale.setScalar(beat);
-      const hidden = m.y + 0.5 > clipPlane.constant;
+      const hidden = m.y > clipPlane.constant; // мітка над зрізом, що стоїть просто на ньому, ще видна
       m.group.visible = !hidden;
       v.copy(m.group.position).add({ x: 0, y: 1.6, z: 0 }).project(camera);
       const show = !hidden && v.z < 1 && Math.abs(v.x) < 1.1 && Math.abs(v.y) < 1.1;
       m.label.hidden = !show;
-      if (show) m.label.style.transform = `translate(${((v.x + 1) / 2) * w}px, ${((1 - v.y) / 2) * h}px) translate(-50%, -100%)`;
+      if (show) shown.push({ m, x: ((v.x + 1) / 2) * w, y: ((1 - v.y) / 2) * h, z: v.z });
+    }
+    // Ярлики не накладаються: ближчий лишається на місці, дальший піднімається над ним.
+    shown.sort((a, b) => a.z - b.z);
+    const placed = [];
+    for (const l of shown) {
+      const lw = (l.m.lw ||= l.m.label.offsetWidth), lh = (l.m.lh ||= l.m.label.offsetHeight);
+      let y = l.y; // нижній край ярлика
+      for (let i = 0; i < 12; i++) {
+        const hit = placed.find((p) => Math.abs(p.x - l.x) < (p.w + lw) / 2 + 2 && y > p.y - p.h - 2 && y - lh < p.y + 2);
+        if (!hit) break;
+        y = hit.y - hit.h - 3;
+      }
+      placed.push({ x: l.x, y, w: lw, h: lh });
+      l.m.label.style.transform = `translate(${l.x}px, ${y}px) translate(-50%, -100%)`;
     }
     renderer.render(scene, camera);
     raf = requestAnimationFrame(loop);
