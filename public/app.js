@@ -1505,9 +1505,15 @@ $('#v3dRock').addEventListener('change', () => {
 // Мітки в 3D. Мітка без Y (або з Y поза моделлю) стоїть на верхньому видимому блоці свого стовпця
 // в межах зрізу, з яким видно 2D-мапу, і не вище повзунка висоти: там само, де її видно на 2D.
 const MARK_PAD = 64; // мітки трохи за межами схематика теж показуємо
+// Верх зрізу в цьому стовпці, як у мода: найменша область, що його містить (при рівних — пізніша), інакше шар.
 function sliceTopAt(layer, wx, wz) {
-  const a = layer.live && (layer.liveAreas || []).find((r) => wx >= r.minX && wx <= r.maxX && wz >= r.minZ && wz <= r.maxZ);
-  return a?.top ?? layer.live?.top ?? layer.model.sliceTop;
+  let best = null, bestSize = Infinity;
+  for (const r of (layer.live && layer.liveAreas) || []) {
+    if (wx < r.minX || wx > r.maxX || wz < r.minZ || wz > r.maxZ) continue;
+    const size = (r.maxX - r.minX + 1) * (r.maxZ - r.minZ + 1);
+    if (size <= bestSize) { best = r; bestSize = size; }
+  }
+  return best?.top ?? layer.live?.top ?? layer.model.sliceTop;
 }
 function standY(layer, wx, wz) {
   const { width: W, height: H, length: L, blocks, palette } = v3d.schem;
