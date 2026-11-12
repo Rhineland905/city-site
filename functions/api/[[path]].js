@@ -13,10 +13,230 @@ const json = (data, status = 200) =>
   });
 const fail = (status, error) => json({ error }, status);
 
-function authorized(request, env) {
-  const pass = env.EDIT_PASSWORD;
-  if (!pass) return false;
-  return request.headers.get('x-password') === pass;
+// Хто робить запит. Рахується один раз на запит у onRequest, далі читається звідси.
+// resident — житель міста з акаунтом (бачить схематики й завдання), editor — може змінювати,
+// admin — увійшов паролем редактора EDIT_PASSWORD під логіном admin і керує акаунтами жителів.
+const WHO = new WeakMap();
+const NOBODY = { user: null, resident: false, editor: false, admin: false };
+const ADMIN = { user: { id: 0, username: 'admin', role: 'admin' }, resident: true, editor: true, admin: true };
+const who = (request) => WHO.get(request) || NOBODY;
+function authorized(request) {
+  return who(request).editor;
+}
+
+const SESSION_COOKIE = 'city_session';
+const SESSION_DAYS = 60;
+const ROLES = ['resident', 'editor'];
+const ADMIN_LOGIN = 'admin';
+// PBKDF2 на безкоштовному плані Cloudflare: більше ітерацій не влазить у ліміт часу процесора.
+const PBKDF2_ITER = 20000;
+const LOGIN_FAILS = 8; // після стількох помилок поспіль вхід у цей акаунт закривається на 15 хвилин
+const LOGIN_LOCK_MS = 15 * 60 * 1000;
+const USERNAME_RE = /^[\p{L}\p{N}_.-]{2,32}$/u;
+
+function readCookie(request, name) {
+  for (const part of (request.headers.get('cookie') || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return null;
+}
+function sessionCookie(request, token, maxAge) {
+  const secure = new URL(request.url).protocol === 'https:' ? '; Secure' : '';
+  return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${secure}`;
+}
+const randomHex = (n) => toHex(crypto.getRandomValues(new Uint8Array(n)));
+const fromHex = (hex) => new Uint8Array(hex.match(/../g).map((b) => parseInt(b, 16)));
+
+async function pbkdf2(password, salt, iter) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations: iter }, key, 256);
+  return toHex(new Uint8Array(bits));
+}
+async function hashPassword(password) {
+  const salt = randomHex(16);
+  return `pbkdf2$${PBKDF2_ITER}$${salt}$${await pbkdf2(password, fromHex(salt), PBKDF2_ITER)}`;
+}
+async function checkPassword(password, stored) {
+  const [kind, iter, salt, hash] = String(stored || '').split('$');
+  if (kind !== 'pbkdf2' || !hash) return false;
+  return sameText(await pbkdf2(password, fromHex(salt), Number(iter)), hash);
+}
+function sameText(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+// Мітка пароля редактора в сесії адміна: змінив EDIT_PASSWORD у Cloudflare — старі входи адміна зникають.
+const adminTag = async (env) => (await sha256('admin:' + env.EDIT_PASSWORD)).slice(0, 32);
+
+async function whoAmI(request, env) {
+  // Пароль у заголовку лишився для скриптів і старих вкладок.
+  const header = request.headers.get('x-password');
+  if (header && env.EDIT_PASSWORD && sameText(header, env.EDIT_PASSWORD)) return ADMIN;
+  const token = readCookie(request, SESSION_COOKIE);
+  if (!token || !/^[0-9a-f]{64}$/.test(token)) return NOBODY;
+  const row = await env.DB.prepare(
+    `SELECT s.kind, s.tag, s.expires_at, u.id, u.username, u.role
+     FROM sessions s LEFT JOIN users u ON u.id = s.user_id WHERE s.token = ?`
+  ).bind(await sha256(token)).first();
+  if (!row || row.expires_at < Date.now()) return NOBODY;
+  if (row.kind === 'admin') {
+    return env.EDIT_PASSWORD && row.tag === (await adminTag(env)) ? ADMIN : NOBODY;
+  }
+  if (!row.id) return NOBODY;
+  return {
+    user: { id: row.id, username: row.username, role: row.role },
+    resident: true, editor: row.role === 'editor', admin: false,
+  };
+}
+const meOut = (w) => ({ user: w.user, editor: w.editor, admin: w.admin });
+
+async function startSession(request, env, kind, userId, tag = '') {
+  const token = randomHex(32);
+  const now = Date.now();
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM sessions WHERE expires_at < ?').bind(now),
+    env.DB.prepare('INSERT INTO sessions (token, kind, user_id, tag, expires_at) VALUES (?, ?, ?, ?, ?)')
+      .bind(await sha256(token), kind, userId, tag, now + SESSION_DAYS * 86400_000),
+  ]);
+  return sessionCookie(request, token, SESSION_DAYS * 86400);
+}
+
+// Вхід, вихід і зміна свого пароля.
+async function auth(request, env, method, action) {
+  if (method === 'GET' && !action) return json(meOut(who(request)));
+
+  if (method === 'DELETE' && !action) {
+    const token = readCookie(request, SESSION_COOKIE);
+    if (token && /^[0-9a-f]{64}$/.test(token)) {
+      await env.DB.prepare('DELETE FROM sessions WHERE token = ?').bind(await sha256(token)).run();
+    }
+    return new Response(JSON.stringify({ ok: true }), {
+      headers: { 'content-type': 'application/json; charset=utf-8', 'set-cookie': sessionCookie(request, '', 0) },
+    });
+  }
+
+  if (method === 'POST' && !action) {
+    const body = await request.json().catch(() => ({}));
+    const username = str(body.username, 64);
+    const password = String(body.password ?? '').slice(0, 200);
+    if (!username || !password) return fail(400, 'Вкажи логін і пароль');
+    const now = Date.now();
+    const wrong = () => fail(401, 'Неправильний логін або пароль');
+
+    let cookie, me;
+    if (username.toLowerCase() === ADMIN_LOGIN) {
+      if (!env.EDIT_PASSWORD) return wrong();
+      const lock = await env.DB.prepare("SELECT value FROM settings WHERE key = 'admin_lock'").first();
+      const st = lock ? JSON.parse(lock.value) : { fails: 0, until: 0 };
+      if (st.until > now) return fail(429, 'Забагато спроб. Спробуй за 15 хвилин');
+      if (!sameText(password, env.EDIT_PASSWORD)) {
+        const fails = st.fails + 1;
+        const next = fails >= LOGIN_FAILS ? { fails: 0, until: now + LOGIN_LOCK_MS } : { fails, until: 0 };
+        await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('admin_lock', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+          .bind(JSON.stringify(next)).run();
+        return wrong();
+      }
+      if (st.fails) await env.DB.prepare("DELETE FROM settings WHERE key = 'admin_lock'").run();
+      cookie = await startSession(request, env, 'admin', null, await adminTag(env));
+      me = ADMIN;
+    } else {
+      const u = await env.DB.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE').bind(username).first();
+      if (!u) return wrong();
+      if (u.locked_until > now) return fail(429, 'Забагато спроб. Спробуй за 15 хвилин');
+      if (!(await checkPassword(password, u.pass_hash))) {
+        const fails = u.fails + 1;
+        await env.DB.prepare('UPDATE users SET fails = ?, locked_until = ? WHERE id = ?')
+          .bind(fails >= LOGIN_FAILS ? 0 : fails, fails >= LOGIN_FAILS ? now + LOGIN_LOCK_MS : 0, u.id).run();
+        return wrong();
+      }
+      await env.DB.prepare("UPDATE users SET fails = 0, locked_until = 0, last_login = datetime('now') WHERE id = ?").bind(u.id).run();
+      cookie = await startSession(request, env, 'user', u.id);
+      me = { user: { id: u.id, username: u.username, role: u.role }, editor: u.role === 'editor', admin: false };
+    }
+    return new Response(JSON.stringify(meOut(me)), {
+      headers: { 'content-type': 'application/json; charset=utf-8', 'set-cookie': cookie },
+    });
+  }
+
+  if (method === 'POST' && action === 'password') {
+    const w = who(request);
+    if (!w.user || w.admin) return fail(401, 'Пароль адміністратора змінюється в Cloudflare (секрет EDIT_PASSWORD)');
+    const body = await request.json().catch(() => ({}));
+    const u = await env.DB.prepare('SELECT pass_hash FROM users WHERE id = ?').bind(w.user.id).first();
+    if (!u || !(await checkPassword(String(body.old ?? ''), u.pass_hash))) return fail(400, 'Старий пароль неправильний');
+    const bad = passwordProblem(body.password);
+    if (bad) return fail(400, bad);
+    await setPassword(env, w.user.id, String(body.password));
+    // Інші входи цього жителя закриваються, а новий вхід тут видаємо одразу.
+    const cookie = await startSession(request, env, 'user', w.user.id);
+    return new Response(JSON.stringify({ ok: true }), {
+      headers: { 'content-type': 'application/json; charset=utf-8', 'set-cookie': cookie },
+    });
+  }
+  return fail(405, 'Метод не підтримується');
+}
+
+function passwordProblem(p) {
+  if (typeof p !== 'string' || p.length < 6) return 'Пароль має бути щонайменше 6 символів';
+  if (p.length > 200) return 'Задовгий пароль';
+  return null;
+}
+async function setPassword(env, userId, password) {
+  await env.DB.batch([
+    env.DB.prepare('UPDATE users SET pass_hash = ?, fails = 0, locked_until = 0 WHERE id = ?').bind(await hashPassword(password), userId),
+    env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId),
+  ]);
+}
+
+// Акаунти жителів: створює й видаляє лише адміністратор.
+const userOut = ({ id, username, role, created_at, last_login }) => ({ id, username, role, created_at, last_login });
+async function users(request, env, method, id) {
+  if (!who(request).admin) return fail(401, 'Потрібен вхід адміністратора');
+  if (!id && method === 'GET') {
+    const { results } = await env.DB.prepare('SELECT * FROM users ORDER BY username COLLATE NOCASE').all();
+    return json(results.map(userOut));
+  }
+  const body = method === 'DELETE' ? {} : await request.json().catch(() => ({}));
+  if (body.role !== undefined && !ROLES.includes(body.role)) return fail(400, 'Невідома роль');
+
+  if (!id && method === 'POST') {
+    const username = str(body.username, 64);
+    if (!USERNAME_RE.test(username)) return fail(400, 'Логін: 2–32 літери, цифри, _ . -');
+    if (username.toLowerCase() === ADMIN_LOGIN) return fail(400, 'Логін admin зайнятий адміністратором');
+    const bad = passwordProblem(body.password);
+    if (bad) return fail(400, bad);
+    const taken = await env.DB.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE').bind(username).first();
+    if (taken) return fail(409, 'Такий логін уже є');
+    const row = await env.DB.prepare('INSERT INTO users (username, pass_hash, role) VALUES (?, ?, ?) RETURNING *')
+      .bind(username, await hashPassword(body.password), body.role || 'resident').first();
+    return json(userOut(row), 201);
+  }
+
+  const userId = int(id);
+  if (userId === null) return fail(400, 'Неправильний id');
+  const cur = await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first();
+  if (!cur) return fail(404, 'Жителя не знайдено');
+
+  if (method === 'PATCH') {
+    if (body.password !== undefined) {
+      const bad = passwordProblem(body.password);
+      if (bad) return fail(400, bad);
+      await setPassword(env, userId, body.password);
+    }
+    if (body.role) await env.DB.prepare('UPDATE users SET role = ? WHERE id = ?').bind(body.role, userId).run();
+    return json(userOut(await env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(userId).first()));
+  }
+  if (method === 'DELETE') {
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId),
+      env.DB.prepare('DELETE FROM users WHERE id = ?').bind(userId),
+    ]);
+    return json({ ok: true });
+  }
+  return fail(405, 'Метод не підтримується');
 }
 
 const str = (v, max = 500) => String(v ?? '').trim().slice(0, max);
@@ -63,6 +283,15 @@ const SCHEMA = [
     author TEXT DEFAULT '', images TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    pass_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'resident',
+    fails INTEGER NOT NULL DEFAULT 0, locked_until INTEGER NOT NULL DEFAULT 0,
+    last_login TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE TABLE IF NOT EXISTS sessions (
+    token TEXT PRIMARY KEY, kind TEXT NOT NULL, user_id INTEGER, tag TEXT DEFAULT '',
+    expires_at INTEGER NOT NULL)`,
+  'CREATE INDEX IF NOT EXISTS sessions_user ON sessions (user_id)',
   LIVE_SCHEMA,
   'CREATE INDEX IF NOT EXISTS live_tiles_updated ON live_tiles (layer, updated_at)',
 ];
@@ -181,9 +410,9 @@ export async function onRequest({ request, env, params, waitUntil }) {
 
   try {
     await ensureSchema(env);
-    if (section === 'auth' && method === 'POST') {
-      return authorized(request, env) ? json({ ok: true }) : fail(401, 'Неправильний пароль');
-    }
+    WHO.set(request, await whoAmI(request, env));
+    if (section === 'auth') return await auth(request, env, method, id);
+    if (section === 'users') return await users(request, env, method, id);
     if (section === 'schematics') return await schematics(request, env, method, id, action);
     if (section === 'tasks') return await tasks(request, env, method, id);
     if (section === 'map') return await map(request, env, method, id, action);
@@ -197,7 +426,10 @@ export async function onRequest({ request, env, params, waitUntil }) {
   }
 }
 
+// Схематики й завдання бачать лише жителі з акаунтом.
+const LOGIN_NEEDED = 'Увійди, щоб бачити схематики й завдання';
 async function schematics(request, env, method, id, action) {
+  if (!who(request).resident) return fail(401, LOGIN_NEEDED);
   if (!id && method === 'GET') {
     const { results } = await env.DB.prepare(
       'SELECT * FROM schematics ORDER BY created_at DESC'
@@ -206,7 +438,7 @@ async function schematics(request, env, method, id, action) {
   }
 
   if (!id && method === 'POST') {
-    if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
+    if (!authorized(request)) return fail(401, 'Потрібні права редактора');
     const form = await request.formData();
     const file = form.get('file');
     if (!file || typeof file === 'string') return fail(400, 'Не вибрано файл');
@@ -248,14 +480,14 @@ async function schematics(request, env, method, id, action) {
         'content-disposition': inline
           ? 'inline'
           : `attachment; filename*=UTF-8''${encodeURIComponent(row.file_name)}`,
-        'cache-control': 'public, max-age=86400',
+        'cache-control': 'private, max-age=86400',
       },
     });
   }
   if (method === 'GET') return json(row);
 
   if (method === 'DELETE') {
-    if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
+    if (!authorized(request)) return fail(401, 'Потрібні права редактора');
     await env.FILES.delete(`schem:${id}`);
     await env.DB.prepare('DELETE FROM schematics WHERE id = ?').bind(id).run();
     return json({ ok: true });
@@ -264,11 +496,12 @@ async function schematics(request, env, method, id, action) {
 }
 
 async function tasks(request, env, method, id) {
+  if (!who(request).resident) return fail(401, LOGIN_NEEDED);
   if (!id && method === 'GET') {
     const { results } = await env.DB.prepare('SELECT * FROM tasks ORDER BY id').all();
     return json(results);
   }
-  if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
+  if (!authorized(request)) return fail(401, 'Потрібні права редактора');
 
   if (!id && method === 'POST') {
     const body = await request.json();
@@ -320,7 +553,7 @@ async function markers(request, env, method, id, action, imageId) {
     return json(results.map(markerOut));
   }
   if (action === 'images') return markerImages(request, env, method, id, imageId);
-  if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
+  if (!authorized(request)) return fail(401, 'Потрібні права редактора');
 
   const body = method === 'DELETE' ? {} : await request.json().catch(() => null);
   if (!body) return fail(400, 'Не вдалося прочитати мітку');
@@ -396,7 +629,7 @@ async function markerImages(request, env, method, id, imageId) {
       },
     });
   }
-  if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
+  if (!authorized(request)) return fail(401, 'Потрібні права редактора');
   const cur = await env.DB.prepare('SELECT * FROM markers WHERE id = ?').bind(markerId).first();
   if (!cur) return fail(404, 'Мітку не знайдено');
   const images = markerOut(cur).images;
@@ -497,7 +730,7 @@ async function map(request, env, method, id, action) {
     });
   }
 
-  if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
+  if (!authorized(request)) return fail(401, 'Потрібні права редактора');
 
   if (method === 'POST' && !id) {
     const form = await request.formData();
@@ -631,7 +864,7 @@ async function sha256(text) {
 }
 // Мод показує ключ, а не пароль редактора: ключ уміє лише надсилати чанки, і його легко замінити.
 async function liveKeyOk(request, env) {
-  if (authorized(request, env)) return true;
+  if (authorized(request)) return true;
   const key = request.headers.get('x-live-key');
   if (!key || key.length > 200) return false;
   const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'live_key'").first();
@@ -674,7 +907,7 @@ async function live(request, env, method, parts, waitUntil) {
   if (!id && method === 'GET') return json({ layers: liveLayers(await getLayers(env)) });
 
   if (id === 'key') {
-    if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
+    if (!authorized(request)) return fail(401, 'Потрібні права редактора');
     const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'live_key'").first();
     if (method === 'GET') return json({ exists: !!row, createdAt: row ? JSON.parse(row.value).createdAt : null });
     if (method === 'POST') {
@@ -767,7 +1000,7 @@ async function live(request, env, method, parts, waitUntil) {
     return json({ saved, unchanged: ok.length - saved, outside: tiles.length - ok.length });
   }
 
-  if (!authorized(request, env)) return fail(401, 'Потрібен пароль редактора');
+  if (!authorized(request)) return fail(401, 'Потрібні права редактора');
 
   // Увімкнути живу мапу для шару й задати зріз за висотою.
   if (method === 'PATCH' && !action) {

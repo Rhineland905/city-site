@@ -13,7 +13,7 @@ const store = {
 
 const DIM_NAMES = { overworld: 'Верхній світ', nether: 'Незер', end: 'Енд' };
 const state = {
-  password: store.get('editPassword') || '',
+  me: null, // { user, editor, admin } або null для гостя
   schematics: [], tasks: [], layers: [], markers: [],
   dim: 'overworld',
   layerId: store.get('layerId'), // null = первый слой измерения, '' = только сетка
@@ -25,7 +25,6 @@ $('#brandName').textContent = CONFIG.cityName;
 // ---------- API ----------
 async function api(path, opts = {}) {
   const headers = { ...(opts.headers || {}) };
-  if (state.password) headers['x-password'] = state.password;
   if (opts.json !== undefined) {
     headers['content-type'] = 'application/json';
     opts.body = JSON.stringify(opts.json);
@@ -33,7 +32,8 @@ async function api(path, opts = {}) {
   const res = await fetch('/api/' + path, { ...opts, headers });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    if (res.status === 401 && state.password) setEditor(false);
+    // Вхід міг закінчитися (вийшов на іншому пристрої, адмін змінив пароль): перевіряємо, хто ми тепер.
+    if (res.status === 401 && state.me && !path.startsWith('auth')) refreshMe();
     throw new Error(data.error || 'Помилка ' + res.status);
   }
   return data;
@@ -48,37 +48,148 @@ function toast(text) {
 }
 
 const isEditor = () => document.body.classList.contains('editor');
+const isResident = () => !!state.me?.user;
+const ROLE_NAMES = { resident: 'Житель', editor: 'Редактор', admin: 'Адміністратор' };
 
-// ---------- Вход ----------
-function setEditor(on) {
-  document.body.classList.toggle('editor', on);
-  $('#loginBtn').textContent = on ? 'Вийти' : 'Увійти';
-  if (!on) { state.password = ''; store.set('editPassword', null); setPlacing(false); stopAreaDraw(); }
+// ---------- Вхід ----------
+// Жителі входять своїм логіном, адміністратор — логіном admin і паролем редактора.
+// Без входу видно лише мапу: схематики й завдання сервер віддає тільки жителям.
+function setSession(me) {
+  const was = state.me?.user?.id;
+  state.me = me?.user ? me : null;
+  const on = isResident();
+  document.body.classList.toggle('resident', on);
+  document.body.classList.toggle('editor', !!state.me?.editor);
+  document.body.classList.toggle('admin', !!state.me?.admin);
+  $('#loginBtn').textContent = on ? state.me.user.username : 'Увійти';
+  $('#loginBtn').title = on ? 'Акаунт' : '';
+  if (!state.me?.editor) { setPlacing(false); stopAreaDraw(); }
   renderPins(); // редактор може перетягувати мітки
   renderMarkersList();
   renderAreas();
+  return was !== state.me?.user?.id; // чи змінився житель
+}
+async function refreshMe() {
+  const me = await api('auth').catch(() => null);
+  if (setSession(me)) await loadPrivate();
+}
+// Схематики й завдання: після входу підвантажуємо, після виходу ховаємо.
+async function loadPrivate() {
+  try { await Promise.all([loadSchematics(), loadTasks()]); }
+  catch (err) { toast('Не вдалося завантажити дані: ' + err.message); }
 }
 
-$('#loginBtn').addEventListener('click', () => {
-  if (isEditor()) return setEditor(false);
-  openDialog('#loginDialog');
-});
+$('#loginBtn').addEventListener('click', () => (isResident() ? openAccount() : openDialog('#loginDialog')));
+$$('[data-login]').forEach((b) => b.addEventListener('click', () => openDialog('#loginDialog')));
 
-$('#loginForm').addEventListener('submit', async (e) => {
+$('#loginForm').addEventListener('submit', (e) => {
   e.preventDefault();
   const form = e.target;
-  state.password = form.password.value;
-  try {
-    await api('auth', { method: 'POST' });
-    store.set('editPassword', state.password);
-    setEditor(true);
+  withBusy(form, async () => {
+    const me = await api('auth', { method: 'POST', json: { username: form.username.value, password: form.password.value } });
+    setSession(me);
     form.closest('dialog').close();
     form.reset();
-    toast('Режим редактора увімкнено');
-  } catch (err) {
-    state.password = '';
-    showError(form, err.message);
-  }
+    toast(me.admin ? 'Ти увійшов як адміністратор' : `Привіт, ${me.user.username}!`);
+    await loadPrivate();
+    const m = location.hash.match(/^#s=(.+)$/);
+    if (m) openSchematic(m[1]);
+  });
+});
+
+function openAccount() {
+  const d = $('#accountDialog');
+  const { user, admin } = state.me;
+  $('[data-who]', d).innerHTML = `Ти увійшов як <b>${esc(user.username)}</b> · ${ROLE_NAMES[user.role] || esc(user.role)}`;
+  $('#passwordForm').hidden = admin;
+  $('#passwordForm').reset();
+  $('[data-pass-error]', d).textContent = '';
+  openDialog('#accountDialog');
+}
+$('#logoutBtn').addEventListener('click', async () => {
+  await api('auth', { method: 'DELETE' }).catch(() => {});
+  $('#accountDialog').close();
+  setSession(null);
+  await loadPrivate();
+  closeDrawer();
+  toast('Ти вийшов');
+});
+$('#passwordForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const err = $('[data-pass-error]', f);
+  err.textContent = '';
+  if (f.password.value !== f.password2.value) { err.textContent = 'Нові паролі не збігаються'; return; }
+  try {
+    await api('auth/password', { method: 'POST', json: { old: f.old.value, password: f.password.value } });
+    f.reset();
+    toast('Пароль змінено');
+  } catch (x) { err.textContent = x.message; }
+});
+
+// Жителі (лише для адміністратора).
+let residents = [];
+async function openResidents() {
+  $('#accountDialog').close();
+  const d = openDialog('#residentsDialog');
+  $('#residentForm').reset();
+  $('#residentsList').innerHTML = '<li class="muted small">Завантаження…</li>';
+  try { residents = await api('users'); renderResidents(); }
+  catch (err) { $('[data-error]', d).textContent = err.message; }
+}
+$('#residentsBtn').addEventListener('click', openResidents);
+const fmtDate = (s) => (s ? new Date(s.replace(' ', 'T') + 'Z').toLocaleDateString('uk-UA') : 'ще не входив');
+function renderResidents() {
+  $('#residentsCount').textContent = residents.length;
+  $('#residentsList').innerHTML = residents.length ? residents.map((u) => `
+    <li data-id="${u.id}">
+      <div class="res-name"><b>${esc(u.username)}</b><span class="muted small-note">вхід: ${esc(fmtDate(u.last_login))}</span></div>
+      <select data-role aria-label="Роль ${esc(u.username)}">
+        <option value="resident"${u.role === 'resident' ? ' selected' : ''}>Житель</option>
+        <option value="editor"${u.role === 'editor' ? ' selected' : ''}>Редактор</option>
+      </select>
+      <button type="button" class="btn" data-reset>Новий пароль</button>
+      <button type="button" class="btn danger" data-remove aria-label="Видалити ${esc(u.username)}" title="Видалити">×</button>
+    </li>`).join('') : '<li class="muted small">Акаунтів ще немає. Додай першого жителя вище.</li>';
+}
+$('#residentForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const f = e.target;
+  withBusy(f, async () => {
+    const u = await api('users', { method: 'POST', json: { username: f.username.value, password: f.password.value, role: f.role.value } });
+    residents.push(u);
+    residents.sort((a, b) => a.username.localeCompare(b.username));
+    renderResidents();
+    toast(`Акаунт ${u.username} створено. Передай жителю логін і пароль.`);
+    f.reset();
+  });
+});
+$('#residentsList').addEventListener('change', async (e) => {
+  const sel = e.target.closest('[data-role]');
+  if (!sel) return;
+  const u = residents.find((r) => r.id === Number(sel.closest('li').dataset.id));
+  try {
+    Object.assign(u, await api('users/' + u.id, { method: 'PATCH', json: { role: sel.value } }));
+    toast(`${u.username}: ${ROLE_NAMES[u.role]}`);
+  } catch (err) { sel.value = u.role; toast(err.message); }
+});
+$('#residentsList').addEventListener('click', async (e) => {
+  const li = e.target.closest('li[data-id]');
+  if (!li) return;
+  const u = residents.find((r) => r.id === Number(li.dataset.id));
+  try {
+    if (e.target.closest('[data-reset]')) {
+      const pass = prompt(`Новий пароль для ${u.username} (щонайменше 6 символів). Старий вхід на всіх пристроях закриється.`);
+      if (!pass) return;
+      await api('users/' + u.id, { method: 'PATCH', json: { password: pass } });
+      toast(`Пароль ${u.username} змінено`);
+    } else if (e.target.closest('[data-remove]')) {
+      if (!confirm(`Видалити акаунт ${u.username}?`)) return;
+      await api('users/' + u.id, { method: 'DELETE' });
+      residents = residents.filter((r) => r !== u);
+      renderResidents();
+    }
+  } catch (err) { toast(err.message); }
 });
 
 // ---------- Диалоги ----------
@@ -2069,7 +2180,7 @@ $('#schemForm').addEventListener('submit', (e) => {
 });
 
 async function loadSchematics() {
-  state.schematics = await api('schematics');
+  state.schematics = isResident() ? await api('schematics') : [];
   renderSchemList();
   renderMarkers();
   if (v3d.mode === '3d') markers3d();
@@ -2165,14 +2276,20 @@ for (const col of $$('.column')) {
 }
 
 async function loadTasks() {
-  state.tasks = await api('tasks');
+  state.tasks = isResident() ? await api('tasks') : [];
   renderTasks();
 }
 
 // ---------- Старт ----------
 (async () => {
-  if (state.password) {
-    try { await api('auth', { method: 'POST' }); setEditor(true); } catch { setEditor(false); }
+  setSession(await api('auth').catch(() => null));
+  // Раніше браузер пам’ятав пароль редактора: один раз міняємо його на звичайний вхід адміністратора.
+  const oldPass = store.get('editPassword');
+  if (oldPass) {
+    store.set('editPassword', null);
+    if (!isResident()) {
+      setSession(await api('auth', { method: 'POST', json: { username: 'admin', password: oldPass } }).catch(() => null));
+    }
   }
   try {
     await Promise.all([loadLayers(), loadSchematics(), loadTasks(), loadMarkers()]);
@@ -2181,7 +2298,8 @@ async function loadTasks() {
     updateBluemapButton();
     if (store.get('mapMode') === '3d' && currentLayer()?.model) setMode('3d');
     const m = location.hash.match(/^#s=(.+)$/);
-    if (m) openSchematic(m[1]);
+    if (m && isResident()) openSchematic(m[1]);
+    else if (m) openDialog('#loginDialog');
   } catch (err) {
     toast('Не вдалося завантажити дані: ' + err.message);
   }
