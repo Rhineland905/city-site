@@ -401,7 +401,10 @@ fieldset:disabled { opacity: .45; }
 .preview .v3d-labels { display: none; }
 
 @media (max-width: 760px) {
-  .v3d-panel { bottom: 64px; }
+  /* Унизу на телефоні панель інструментів мапи у кілька рядів, тож панель 3D стоїть угорі. */
+  .v3d-panel { top: 12px; bottom: auto; padding: 8px 12px; gap: 4px; }
+  .v3d-panel .check { margin-top: 0; }
+  .v3d-tex { padding-top: 6px; }
   .small-note { display: none; }
 }
 
