@@ -200,6 +200,38 @@ export async function openPacks(files) {
   return assets;
 }
 
+// Архів лише з текстурами (папка textures/block без моделей блоків), наприклад розпакована з гри
+// папка textures. Моделей у ньому немає, тож 3D бере з нього самі картинки, а форми блоків малює сайт.
+// Повертає Map ім'я → { px: Uint8Array RGBA 16×16 (перший кадр анімації), tint } або null, якщо це інший файл.
+const TEX_ONLY = /(?:^|\/)textures\/block\/([a-z0-9_]+)\.png$/;
+const BIOME_TINT = /^(grass_block_top|grass_block_side_overlay|short_grass|grass|tall_grass_(top|bottom)|fern|large_fern_(top|bottom)|vine|lily_pad|sugar_cane|water_(still|flow)|(oak|jungle|acacia|dark_oak|mangrove|birch|spruce)_leaves|(attached_)?(melon|pumpkin)_stem)$/;
+export async function openTextureZip(files, onProgress) {
+  const list = [...files];
+  if (list.length !== 1 || !/\.zip$/i.test(list[0].name)) return null;
+  let z;
+  try { z = await Zip.open(list[0]); } catch { return null; }
+  const names = [...z.entries.keys()];
+  if (names.some((n) => n.includes('/blockstates/'))) return null; // повний ресурспак або гра: звичайний шлях
+  const found = names.filter((n) => TEX_ONLY.test(n));
+  if (found.length < 20) return null;
+  const c = canvas(16, 16);
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.imageSmoothingEnabled = false;
+  const tiles = new Map();
+  for (let i = 0; i < found.length; i++) {
+    try {
+      const bmp = await createImageBitmap(new Blob([await z.read(found[i])], { type: 'image/png' }));
+      g.clearRect(0, 0, 16, 16);
+      g.drawImage(bmp, 0, 0, bmp.width, bmp.width, 0, 0, 16, 16);
+      bmp.close?.();
+      const name = TEX_ONLY.exec(found[i])[1];
+      tiles.set(name, { px: new Uint8Array(g.getImageData(0, 0, 16, 16).data.buffer.slice(0)), tint: BIOME_TINT.test(name) });
+    } catch { /* зіпсована картинка: пропускаємо */ }
+    if (onProgress && i % 100 === 0) { onProgress(i, found.length); await new Promise((r) => setTimeout(r, 0)); }
+  }
+  return tiles.size >= 20 ? tiles : null;
+}
+
 // ---------- Вибір моделей за станом блока ----------
 function parseState(state) {
   const m = /^([^[]+)(?:\[(.*)\])?$/.exec(state);
@@ -1030,6 +1062,6 @@ function idb(mode, fn) {
     };
   });
 }
-export const rememberPacks = (files) => idb('readwrite', (s) => s.put([...files], 'textures')).catch((e) => console.warn('Текстури не запам’яталися:', e));
-export const rememberedPacks = () => idb('readonly', (s) => s.get('textures')).catch(() => null);
-export const forgetPacks = () => idb('readwrite', (s) => s.delete('textures')).catch(() => {});
+export const rememberPacks = (files, key = 'textures') => idb('readwrite', (s) => s.put([...files], key)).catch((e) => console.warn('Текстури не запам’яталися:', e));
+export const rememberedPacks = (key = 'textures') => idb('readonly', (s) => s.get(key)).catch(() => null);
+export const forgetPacks = (key = 'textures') => idb('readwrite', (s) => s.delete(key)).catch(() => {});

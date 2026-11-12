@@ -1438,6 +1438,34 @@ async function dropPacks() {
   await tx.forgetPacks();
   Object.assign(packs, { assets: null, files: null, baked: new WeakMap() });
 }
+// Архів лише з текстурами (textures.zip): теж лишається тільки в цьому браузері. Моделей у ньому немає,
+// тож він замінює відкритий ресурспак у «піксельному» 3D. null — беремо відкритий пак із сайту.
+// site: зараз 3D малюється текстурами, які редактор поклав на сайт для всіх.
+const texZip = { tiles: null, name: '', opening: null, site: false };
+function getTexZip() {
+  if (texZip.tiles) return Promise.resolve(texZip.tiles);
+  texZip.opening ??= (async () => {
+    try {
+      const tx = await loadTextures();
+      const files = await tx.rememberedPacks('texzip');
+      if (!files?.length) return null;
+      const tiles = await tx.openTextureZip(files);
+      if (tiles && !texZip.tiles) Object.assign(texZip, { tiles, name: files[0].name });
+      return texZip.tiles;
+    } catch (e) {
+      console.warn('Запам’ятаний архів текстур не відкрився:', e);
+      return null;
+    }
+  })();
+  return texZip.opening;
+}
+// Текстури для 3D без моделей гри: свій архів, якщо вибрано, інакше відкритий пак.
+async function pixelKit() {
+  const m = await import('./pixels.js');
+  const site = (await getTexZip()) ? null : await m.loadSitePack();
+  texZip.site = !!site;
+  return { pixelBlocks: m.pixelBlocks, pack: (await getTexZip()) || site || (await m.loadOpenPack()) };
+}
 // Моделі блоків схематика з текстурами: збираються раз на схематик і набір файлів.
 function bakedFor(schem, onProgress) {
   const assets = packs.assets;
@@ -1492,7 +1520,7 @@ async function show3d() {
       v3dStatus('Завантажую 3D-модель міста…');
       const [{ createViewer }, { pixelBlocks, pack }, buf, colors] = await Promise.all([
         import('./voxel.js'),
-        import('./pixels.js').then(async (m) => ({ ...m, pack: await m.loadOpenPack() })),
+        pixelKit(),
         fetch(`/api/map/${encodeURIComponent(layer.id)}/model?v=${layer.model.version}`).then((r) => {
           if (!r.ok) throw new Error('модель не знайдено');
           return r.arrayBuffer();
@@ -1613,8 +1641,8 @@ async function syncBlocks3d(key, first) {
     v3d.blocksSince = since;
     if (!changed || v3d.key !== key) return;
     // Блоки змінилися: текстури й моделі блоків рахуємо заново (могли з’явитися нові стани).
-    const { pixelBlocks, loadOpenPack } = await import('./pixels.js');
-    v3d.pixels = pixelBlocks(schem.states, v3d.colors, await loadOpenPack());
+    const kit = await pixelKit();
+    v3d.pixels = kit.pixelBlocks(schem.states, v3d.colors, kit.pack);
     packs.baked.delete(schem);
     v3d.baked = v3d.bakedWith = null;
     if (!first) { build3d(true); markers3d(); texture3d(); }
@@ -1670,16 +1698,32 @@ async function texture3d() {
 }
 
 function renderTexInfo() {
-  const on = !!packs.assets;
+  const on = !!packs.assets || !!texZip.tiles;
   $('#v3dTexBtn').textContent = on ? 'Прибрати текстури' : 'Текстури з гри';
-  $('.v3d-credit').hidden = on; // з файлом гри текстури вже не з паку
-  $('#v3dTexInfo').innerHTML = on
+  $('.v3d-credit').hidden = on || texZip.site; // з файлом гри текстури вже не з паку
+  $('#v3dPackDel').hidden = !texZip.site;
+  $('#v3dTexInfo').innerHTML = packs.assets
     ? `Текстури: ${esc(packName())}. Файл запам’ятано лише в цьому браузері, на сайт він не йде.`
-    : 'Зараз текстури з відкритого ресурспаку <a href="/pack/CREDITS.txt" target="_blank" rel="noopener">Pixel Perfection</a>. Для справжніх текстур і моделей вибери на комп’ютері файл гри: <span class="mono">%APPDATA%\\.minecraft\\versions\\26.3\\26.3.jar</span>. Він читається лише в цьому браузері й нікуди не завантажується.';
+    : texZip.tiles ? `Текстури: ${esc(texZip.name)}. Архів запам’ятано лише в цьому браузері, на сайт він не йде.`
+    : texZip.site ? 'Текстури гри, які редактор поклав на сайт для всіх. Для справжніх моделей блоків вибери на комп’ютері файл гри (.jar).'
+    : 'Зараз текстури з відкритого ресурспаку <a href="/pack/CREDITS.txt" target="_blank" rel="noopener">Pixel Perfection</a>. Для справжніх текстур і моделей вибери на комп’ютері файл гри: <span class="mono">%APPDATA%\\.minecraft\\versions\\26.3\\26.3.jar</span>, а на телефоні — архів <span class="mono">textures.zip</span> із текстурами гри. Він читається лише в цьому браузері й нікуди не завантажується.';
 }
 renderTexInfo();
+// Перемалювати 3D «піксельним» шляхом із поточними текстурами (свій архів або відкритий пак).
+async function repixel3d() {
+  if (!v3d.schem) return;
+  const kit = await pixelKit();
+  v3d.pixels = kit.pixelBlocks(v3d.schem.states || v3d.schem.palette, v3d.colors, kit.pack);
+  if (!v3d.baked) build3d(true);
+}
 $('#v3dTexBtn').addEventListener('click', async () => {
-  if (!packs.assets) { $('#v3dTexFile').click(); return; }
+  if (!packs.assets && !texZip.tiles) { $('#v3dTexFile').click(); return; }
+  if (texZip.tiles) {
+    (await loadTextures()).forgetPacks('texzip');
+    Object.assign(texZip, { tiles: null, name: '', opening: null });
+    await repixel3d();
+    if (!packs.assets) { renderTexInfo(); toast('Текстури прибрано, архів забуто'); return; }
+  }
   await dropPacks();
   Object.assign(fromSchem, { assets: null, texName: '', tiles: null }); // і «Мапа зі схематика» без них
   v3d.baked = v3d.bakedWith = null;
@@ -1687,12 +1731,50 @@ $('#v3dTexBtn').addEventListener('click', async () => {
   renderTexInfo();
   toast('Текстури прибрано, файл гри забуто');
 });
+$('#v3dPackDel').addEventListener('click', async () => {
+  if (!confirm('Прибрати текстури гри з сайту? 3D у всіх повернеться до відкритого ресурспаку.')) return;
+  try {
+    await api('pack', { method: 'DELETE' });
+    (await import('./pixels.js')).resetSitePack();
+    await repixel3d();
+    renderTexInfo();
+    toast('Текстури з сайту прибрано');
+  } catch (err) { toast(err.message); }
+});
 $('#v3dTexFile').addEventListener('change', async (e) => {
   const files = [...e.target.files];
   e.target.value = '';
   if (!files.length) return;
   v3dStatus('Відкриваю файл гри…');
   try {
+    // Архів лише з текстурами: без моделей, тож іде «піксельним» шляхом.
+    const tx = await loadTextures();
+    const tiles = await tx.openTextureZip(files, (i, n) => v3dStatus(`Читаю текстури: ${i} з ${n}…`));
+    if (tiles && isEditor() && confirm(`Показувати ці текстури (${tiles.size}) у 3D усім відвідувачам сайту?\n\nЯк у BlueMap: текстури з твоєї гри роздаватиме сайт. Відповідальність за це перед Mojang на власникові сайту. «Скасувати» — лишити їх тільки в цьому браузері.`)) {
+      v3dStatus('Кладу текстури на сайт…');
+      const px = await import('./pixels.js');
+      const { blob, meta } = await px.buildSheet(tiles);
+      const fd = new FormData();
+      fd.set('image', blob, 'blocks.png');
+      fd.set('meta', JSON.stringify(meta));
+      fd.set('name', files[0].name);
+      await api('pack', { method: 'POST', body: fd });
+      px.resetSitePack();
+      await repixel3d();
+      renderTexInfo();
+      v3dStatus('');
+      toast(`Текстури на сайті: ${tiles.size}. Тепер 3D у всіх із ними`);
+      return;
+    }
+    if (tiles) {
+      Object.assign(texZip, { tiles, name: files[0].name, opening: null });
+      tx.rememberPacks(files, 'texzip');
+      await repixel3d();
+      renderTexInfo();
+      v3dStatus('');
+      toast(`Текстури з ${files[0].name}: ${tiles.size}. Архів лишається лише в цьому браузері`);
+      return;
+    }
     await usePacks(files);
     Object.assign(fromSchem, { assets: null, texName: '', tiles: null }); // діалог мапи візьме новий файл
   } catch (err) {
@@ -2211,7 +2293,7 @@ async function openSchematic(id) {
         return r.arrayBuffer();
       }),
       import('./voxel.js'),
-      import('./pixels.js').then(async (m) => ({ ...m, pack: await m.loadOpenPack() })),
+      pixelKit(),
       getBlockColors(),
     ]);
     const parsed = await parseSchematic(buf, s.file_name);

@@ -386,13 +386,11 @@ function tileFor(name, face, rgb) {
 // public/pack/blocks.png — текстури Pixel Perfection CE і VoxeLibre (CC BY-SA, автори в public/pack/CREDITS.md),
 // зібрані scripts/build-open-pack.py. Вони вільні для поширення, тож лежать на сайті й працюють у всіх,
 // навіть на телефоні. Чого в паку немає, малюємо самі (малюнки вище).
-let packPromise = null;
-export function loadOpenPack() {
-  packPromise ??= (async () => {
-    const [meta, img] = await Promise.all([
-      fetch('/pack/blocks.json').then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))),
-      new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = '/pack/blocks.png'; }),
-    ]);
+// Аркуш текстур (картинка з квадратами 16×16 і опис { size, cols, tiles: { ім'я: [номер, тонувати] } })
+// → Map ім'я → { px, tint }.
+async function loadSheet(meta, src) {
+  {
+    const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = src; });
     const c = document.createElement('canvas');
     c.width = img.width; c.height = img.height;
     const g = c.getContext('2d', { willReadFrequently: true });
@@ -409,8 +407,42 @@ export function loadOpenPack() {
       tiles.set(name, { px, tint: !!tint });
     }
     return tiles;
-  })().catch((e) => { console.warn('Відкритий ресурспак не завантажився:', e); packPromise = null; return null; });
+  }
+}
+let packPromise = null;
+export function loadOpenPack() {
+  packPromise ??= fetch('/pack/blocks.json').then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+    .then((meta) => loadSheet(meta, '/pack/blocks.png'))
+    .catch((e) => { console.warn('Відкритий ресурспак не завантажився:', e); packPromise = null; return null; });
   return packPromise;
+}
+
+// Текстури, які редактор поклав на сайт для всіх (як BlueMap роздає текстури з гри сервера).
+// null, якщо їх немає: тоді працює відкритий пак. resetSitePack() — після заміни чи видалення.
+let sitePromise = null;
+export function loadSitePack() {
+  sitePromise ??= fetch('/api/pack', { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null))
+    .then((meta) => (meta?.tiles ? loadSheet(meta, `/api/pack/image?v=${meta.v || 0}`) : null))
+    .catch((e) => { console.warn('Текстури сайту не завантажились:', e); return null; });
+  return sitePromise;
+}
+export const resetSitePack = () => { sitePromise = null; };
+
+// Текстури (Map із openTextureZip) → аркуш для сайту: { blob PNG, meta }.
+export async function buildSheet(tiles) {
+  const names = [...tiles.keys()].sort();
+  const cols = 32, rows = Math.ceil(names.length / cols);
+  const c = document.createElement('canvas');
+  c.width = cols * S; c.height = rows * S;
+  const g = c.getContext('2d');
+  const meta = { size: S, cols, tiles: {} };
+  names.forEach((n, i) => {
+    const t = tiles.get(n);
+    g.putImageData(new ImageData(new Uint8ClampedArray(t.px), S, S), (i % cols) * S, Math.floor(i / cols) * S);
+    meta.tiles[n] = t.tint ? [i, 1] : [i];
+  });
+  const blob = await new Promise((res) => c.toBlob(res, 'image/png'));
+  return { blob, meta };
 }
 
 // Колір біому для сірих текстур (як рівнини в грі).

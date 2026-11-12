@@ -429,6 +429,7 @@ export async function onRequest({ request, env, params, waitUntil }) {
     if (section === 'markers') return await markers(request, env, method, id, action, parts[3]);
     if (section === 'live') return await live(request, env, method, parts, waitUntil);
     if (section === 'colors' && method === 'GET') return json(await getColors(env));
+    if (section === 'pack') return await pack(request, env, method, id);
     return fail(404, 'Не знайдено');
   } catch (e) {
     console.error(e);
@@ -819,6 +820,53 @@ async function map(request, env, method, id, action) {
     await env.DB.prepare('DELETE FROM live_tiles WHERE layer = ?').bind(id).run();
     await env.DB.prepare('DELETE FROM live_blocks WHERE layer = ?').bind(id).run();
     await saveLayers(env, layers.filter((l) => l.id !== id));
+    return json({ ok: true });
+  }
+  return fail(405, 'Метод не підтримується');
+}
+
+// ---------- Текстури блоків для 3D ----------
+// Редактор кладе на сайт аркуш текстур зі своєї гри (як BlueMap бере їх із гри сервера), і 3D у всіх
+// малюється ними. Аркуш збирає браузер редактора: PNG із квадратами 16×16 і опис, де який блок.
+const PACK_MAX_PNG = 2 * 1024 * 1024;
+const PACK_MAX_TILES = 4096;
+async function pack(request, env, method, id) {
+  if (method === 'GET' && !id) {
+    const meta = await env.FILES.get('pack:meta', 'json');
+    if (!meta) return fail(404, 'Текстур на сайті немає');
+    return new Response(JSON.stringify(meta), { headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
+  }
+  if (method === 'GET' && id === 'image') {
+    const data = await env.FILES.get('pack:image', 'arrayBuffer');
+    if (!data) return fail(404, 'Текстур на сайті немає');
+    return new Response(data, { headers: { 'content-type': 'image/png', 'cache-control': 'public, max-age=31536000, immutable' } }); // в адресі версія
+  }
+  if (!authorized(request)) return fail(401, 'Потрібні права редактора');
+  if (method === 'POST' && !id) {
+    const form = await request.formData();
+    const image = form.get('image');
+    if (!image || typeof image === 'string' || !image.size) return fail(400, 'Немає картинки з текстурами');
+    if (image.size > PACK_MAX_PNG) return fail(400, 'Завеликий аркуш текстур');
+    const bytes = new Uint8Array(await image.arrayBuffer());
+    if (![137, 80, 78, 71, 13, 10, 26, 10].every((b, k) => bytes[k] === b)) return fail(400, 'Аркуш текстур має бути PNG');
+    let meta;
+    try { meta = JSON.parse(String(form.get('meta') || '')); } catch { return fail(400, 'Немає опису текстур'); }
+    const cols = int(meta?.cols), entries = Object.entries(meta?.tiles || {});
+    if (meta?.size !== 16 || !(cols > 0 && cols <= 256) || !entries.length || entries.length > PACK_MAX_TILES) return fail(400, 'Неправильний опис текстур');
+    const tiles = {};
+    for (const [name, v] of entries) {
+      const i = Array.isArray(v) ? int(v[0]) : null;
+      if (!/^[a-z0-9_]{1,80}$/.test(name) || i === null || i < 0 || i >= PACK_MAX_TILES) return fail(400, 'Неправильний опис текстур');
+      tiles[name] = v[1] ? [i, 1] : [i];
+    }
+    const saved = { size: 16, cols, tiles, v: Date.now(), name: str(form.get('name'), 80) };
+    await env.FILES.put('pack:image', bytes);
+    await env.FILES.put('pack:meta', JSON.stringify(saved));
+    return json({ ok: true, v: saved.v, count: entries.length });
+  }
+  if (method === 'DELETE' && !id) {
+    await env.FILES.delete('pack:meta');
+    await env.FILES.delete('pack:image');
     return json({ ok: true });
   }
   return fail(405, 'Метод не підтримується');
