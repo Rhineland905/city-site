@@ -1438,6 +1438,34 @@ async function dropPacks() {
   await tx.forgetPacks();
   Object.assign(packs, { assets: null, files: null, baked: new WeakMap() });
 }
+// Архів лише з текстурами (textures.zip): теж лишається тільки в цьому браузері. Моделей у ньому немає,
+// тож він замінює відкритий ресурспак у «піксельному» 3D. null — беремо відкритий пак із сайту.
+// site: зараз 3D малюється текстурами, які редактор поклав на сайт для всіх.
+const texZip = { tiles: null, name: '', opening: null, site: false };
+function getTexZip() {
+  if (texZip.tiles) return Promise.resolve(texZip.tiles);
+  texZip.opening ??= (async () => {
+    try {
+      const tx = await loadTextures();
+      const files = await tx.rememberedPacks('texzip');
+      if (!files?.length) return null;
+      const tiles = await tx.openTextureZip(files);
+      if (tiles && !texZip.tiles) Object.assign(texZip, { tiles, name: files[0].name });
+      return texZip.tiles;
+    } catch (e) {
+      console.warn('Запам’ятаний архів текстур не відкрився:', e);
+      return null;
+    }
+  })();
+  return texZip.opening;
+}
+// Текстури для 3D без моделей гри: свій архів, якщо вибрано, інакше відкритий пак.
+async function pixelKit() {
+  const m = await import('./pixels.js');
+  const site = (await getTexZip()) ? null : await m.loadSitePack();
+  texZip.site = !!site;
+  return { pixelBlocks: m.pixelBlocks, pack: (await getTexZip()) || site || (await m.loadOpenPack()) };
+}
 // Моделі блоків схематика з текстурами: збираються раз на схематик і набір файлів.
 function bakedFor(schem, onProgress) {
   const assets = packs.assets;
@@ -1492,7 +1520,7 @@ async function show3d() {
       v3dStatus('Завантажую 3D-модель міста…');
       const [{ createViewer }, { pixelBlocks, pack }, buf, colors] = await Promise.all([
         import('./voxel.js'),
-        import('./pixels.js').then(async (m) => ({ ...m, pack: await m.loadOpenPack() })),
+        pixelKit(),
         fetch(`/api/map/${encodeURIComponent(layer.id)}/model?v=${layer.model.version}`).then((r) => {
           if (!r.ok) throw new Error('модель не знайдено');
           return r.arrayBuffer();
@@ -1510,6 +1538,9 @@ async function show3d() {
       v3d.baked = v3d.bakedWith = null; // моделі блоків належать попередньому схематику
       // Без файлу гри блоки однаково піксельні: сайт малює їм схожі на гру текстури сам.
       v3d.pixels = pixelBlocks(schem.states || schem.palette, colors, pack);
+      // Що гравці збудували після схематика: блоки чанків, які надіслав мод.
+      v3d.blocksSince = 0;
+      await syncBlocks3d(key, true);
       $('#v3dRock').checked = naturalShare(schem) > 0.4;
       const clip = $('#v3dClip');
       clip.min = layer.model.minY;
@@ -1526,6 +1557,105 @@ async function show3d() {
     v3dStatus('Не вдалося відкрити 3D: ' + err.message);
   }
 }
+
+// ---------- 3D оновлюється від мода ----------
+// Мод надсилає блоки чанків у межах моделі (gzip: i16 minY, u16 висота, u16 розмір палітри, стани блоків,
+// далі номери в палітрі в порядку x + z*16 + y*256). Вставляємо їх у схематик поверх того, що було у файлі.
+async function gunzipBytes(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+// Повертає, скільки блоків схематика змінилося.
+function applyChunkBlocks(schem, layer, cx, cz, raw) {
+  const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  const minY = dv.getInt16(0), h = dv.getUint16(2), count = dv.getUint16(4);
+  const dec = new TextDecoder();
+  let o = 6;
+  schem.states ||= schem.palette.slice();
+  schem.stateIndex ||= new Map(schem.states.map((st, i) => [st, i]));
+  const ids = new Array(count);
+  for (let i = 0; i < count; i++) {
+    const n = dv.getUint16(o);
+    const st = dec.decode(raw.subarray(o + 2, o + 2 + n));
+    o += 2 + n;
+    let id = schem.stateIndex.get(st);
+    if (id === undefined) {
+      if (schem.states.length >= 65535) { ids[i] = -1; continue; }
+      id = schem.states.length;
+      schem.states.push(st);
+      schem.palette.push(st.replace(/\[.*$/, ''));
+      schem.stateIndex.set(st, id);
+    }
+    ids[i] = id;
+  }
+  const wide = count > 256;
+  if (raw.length < o + h * 256 * (wide ? 2 : 1)) throw new Error('обрізані блоки чанка');
+  const { width: W, height: H, length: L, blocks } = schem;
+  const x0 = cx * 16 - layer.originX, z0 = cz * 16 - layer.originZ, y0 = minY - layer.model.minY;
+  let changed = 0;
+  for (let ly = 0; ly < h; ly++) {
+    const y = y0 + ly;
+    if (y < 0 || y >= H) continue;
+    for (let lz = 0; lz < 16; lz++) {
+      const z = z0 + lz;
+      if (z < 0 || z >= L) continue;
+      for (let lx = 0; lx < 16; lx++) {
+        const x = x0 + lx;
+        if (x < 0 || x >= W) continue;
+        const k = o + (lx + lz * 16 + ly * 256) * (wide ? 2 : 1);
+        const id = ids[wide ? dv.getUint16(k) : raw[k]];
+        const i = x + z * W + y * W * L;
+        if (id >= 0 && blocks[i] !== id) { blocks[i] = id; changed++; }
+      }
+    }
+  }
+  return changed;
+}
+// Забирає з сайту блоки чанків, змінені після v3d.blocksSince. first — перше завантаження (місто ще не збудоване).
+async function syncBlocks3d(key, first) {
+  const layer = v3d.layer, schem = v3d.schem;
+  if (!layer?.live || !schem || v3d.blocksBusy) return;
+  v3d.blocksBusy = true;
+  try {
+    let changed = 0, since = v3d.blocksSince, offset = 0;
+    for (;;) {
+      const r = await fetch(`/api/live/${encodeURIComponent(layer.id)}/blocks?since=${v3d.blocksSince}&offset=${offset}`);
+      if (!r.ok) break;
+      const buf = new Uint8Array(await r.arrayBuffer());
+      const dv = new DataView(buf.buffer);
+      let o = 0, n = 0;
+      while (o + 20 <= buf.length) {
+        const cx = dv.getInt32(o), cz = dv.getInt32(o + 4), at = dv.getFloat64(o + 8), len = dv.getUint32(o + 16);
+        try {
+          const raw = await gunzipBytes(buf.subarray(o + 20, o + 20 + len));
+          if (v3d.key !== key) return;
+          changed += applyChunkBlocks(schem, layer, cx, cz, raw);
+        } catch (e) { console.warn('Блоки чанка', cx, cz, e); }
+        since = Math.max(since, at + 1);
+        o += 20 + len;
+        n++;
+      }
+      offset += n;
+      if (r.headers.get('x-more') !== '1' || !n) break;
+    }
+    v3d.blocksSince = since;
+    if (!changed || v3d.key !== key) return;
+    // Блоки змінилися: текстури й моделі блоків рахуємо заново (могли з’явитися нові стани).
+    const kit = await pixelKit();
+    v3d.pixels = kit.pixelBlocks(schem.states, v3d.colors, kit.pack);
+    packs.baked.delete(schem);
+    v3d.baked = v3d.bakedWith = null;
+    if (!first) { build3d(true); markers3d(); texture3d(); }
+  } catch (e) {
+    console.warn('3D: блоки з мода не завантажились', e);
+  } finally {
+    v3d.blocksBusy = false;
+  }
+}
+// Поки відкрито 3D, раз на хвилину питаємо, чи не збудували щось нове.
+setInterval(() => {
+  if (v3d.mode === '3d' && v3d.key && !document.hidden) syncBlocks3d(v3d.key, false);
+}, 60_000);
 
 function build3d(keepView) {
   const model = v3d.viewer.setModel(v3d.schem, {
@@ -1568,16 +1698,32 @@ async function texture3d() {
 }
 
 function renderTexInfo() {
-  const on = !!packs.assets;
+  const on = !!packs.assets || !!texZip.tiles;
   $('#v3dTexBtn').textContent = on ? 'Прибрати текстури' : 'Текстури з гри';
-  $('.v3d-credit').hidden = on; // з файлом гри текстури вже не з паку
-  $('#v3dTexInfo').innerHTML = on
+  $('.v3d-credit').hidden = on || texZip.site; // з файлом гри текстури вже не з паку
+  $('#v3dPackDel').hidden = !texZip.site;
+  $('#v3dTexInfo').innerHTML = packs.assets
     ? `Текстури: ${esc(packName())}. Файл запам’ятано лише в цьому браузері, на сайт він не йде.`
-    : 'Зараз текстури з відкритого ресурспаку <a href="/pack/CREDITS.txt" target="_blank" rel="noopener">Pixel Perfection</a>. Для справжніх текстур і моделей вибери на комп’ютері файл гри: <span class="mono">%APPDATA%\\.minecraft\\versions\\26.3\\26.3.jar</span>. Він читається лише в цьому браузері й нікуди не завантажується.';
+    : texZip.tiles ? `Текстури: ${esc(texZip.name)}. Архів запам’ятано лише в цьому браузері, на сайт він не йде.`
+    : texZip.site ? 'Текстури гри, які редактор поклав на сайт для всіх. Для справжніх моделей блоків вибери на комп’ютері файл гри (.jar).'
+    : 'Зараз текстури з відкритого ресурспаку <a href="/pack/CREDITS.txt" target="_blank" rel="noopener">Pixel Perfection</a>. Для справжніх текстур і моделей вибери на комп’ютері файл гри: <span class="mono">%APPDATA%\\.minecraft\\versions\\26.3\\26.3.jar</span>, а на телефоні — архів <span class="mono">textures.zip</span> із текстурами гри. Він читається лише в цьому браузері й нікуди не завантажується.';
 }
 renderTexInfo();
+// Перемалювати 3D «піксельним» шляхом із поточними текстурами (свій архів або відкритий пак).
+async function repixel3d() {
+  if (!v3d.schem) return;
+  const kit = await pixelKit();
+  v3d.pixels = kit.pixelBlocks(v3d.schem.states || v3d.schem.palette, v3d.colors, kit.pack);
+  if (!v3d.baked) build3d(true);
+}
 $('#v3dTexBtn').addEventListener('click', async () => {
-  if (!packs.assets) { $('#v3dTexFile').click(); return; }
+  if (!packs.assets && !texZip.tiles) { $('#v3dTexFile').click(); return; }
+  if (texZip.tiles) {
+    (await loadTextures()).forgetPacks('texzip');
+    Object.assign(texZip, { tiles: null, name: '', opening: null });
+    await repixel3d();
+    if (!packs.assets) { renderTexInfo(); toast('Текстури прибрано, архів забуто'); return; }
+  }
   await dropPacks();
   Object.assign(fromSchem, { assets: null, texName: '', tiles: null }); // і «Мапа зі схематика» без них
   v3d.baked = v3d.bakedWith = null;
@@ -1585,12 +1731,50 @@ $('#v3dTexBtn').addEventListener('click', async () => {
   renderTexInfo();
   toast('Текстури прибрано, файл гри забуто');
 });
+$('#v3dPackDel').addEventListener('click', async () => {
+  if (!confirm('Прибрати текстури гри з сайту? 3D у всіх повернеться до відкритого ресурспаку.')) return;
+  try {
+    await api('pack', { method: 'DELETE' });
+    (await import('./pixels.js')).resetSitePack();
+    await repixel3d();
+    renderTexInfo();
+    toast('Текстури з сайту прибрано');
+  } catch (err) { toast(err.message); }
+});
 $('#v3dTexFile').addEventListener('change', async (e) => {
   const files = [...e.target.files];
   e.target.value = '';
   if (!files.length) return;
   v3dStatus('Відкриваю файл гри…');
   try {
+    // Архів лише з текстурами: без моделей, тож іде «піксельним» шляхом.
+    const tx = await loadTextures();
+    const tiles = await tx.openTextureZip(files, (i, n) => v3dStatus(`Читаю текстури: ${i} з ${n}…`));
+    if (tiles && isEditor() && confirm(`Показувати ці текстури (${tiles.size}) у 3D усім відвідувачам сайту?\n\nЯк у BlueMap: текстури з твоєї гри роздаватиме сайт. Відповідальність за це перед Mojang на власникові сайту. «Скасувати» — лишити їх тільки в цьому браузері.`)) {
+      v3dStatus('Кладу текстури на сайт…');
+      const px = await import('./pixels.js');
+      const { blob, meta } = await px.buildSheet(tiles);
+      const fd = new FormData();
+      fd.set('image', blob, 'blocks.png');
+      fd.set('meta', JSON.stringify(meta));
+      fd.set('name', files[0].name);
+      await api('pack', { method: 'POST', body: fd });
+      px.resetSitePack();
+      await repixel3d();
+      renderTexInfo();
+      v3dStatus('');
+      toast(`Текстури на сайті: ${tiles.size}. Тепер 3D у всіх із ними`);
+      return;
+    }
+    if (tiles) {
+      Object.assign(texZip, { tiles, name: files[0].name, opening: null });
+      tx.rememberPacks(files, 'texzip');
+      await repixel3d();
+      renderTexInfo();
+      v3dStatus('');
+      toast(`Текстури з ${files[0].name}: ${tiles.size}. Архів лишається лише в цьому браузері`);
+      return;
+    }
     await usePacks(files);
     Object.assign(fromSchem, { assets: null, texName: '', tiles: null }); // діалог мапи візьме новий файл
   } catch (err) {
@@ -1990,6 +2174,7 @@ $('#fromSchemForm').addEventListener('submit', (e) => {
       fd.set('height', canvas.height);
       fd.set('model', fromSchem.file);
       fd.set('modelMinY', form.minY.value);
+      if (fromSchem.schem?.height) fd.set('modelHeight', fromSchem.schem.height);
       fd.set('sliceTop', form.topY.value);
       fd.set('sliceBottom', form.bottomY.value);
       if (tx) fd.set('colors', JSON.stringify(tx.blockColors(fromSchem.schem, fromSchem.tiles)));
@@ -2108,7 +2293,7 @@ async function openSchematic(id) {
         return r.arrayBuffer();
       }),
       import('./voxel.js'),
-      import('./pixels.js').then(async (m) => ({ ...m, pack: await m.loadOpenPack() })),
+      pixelKit(),
       getBlockColors(),
     ]);
     const parsed = await parseSchematic(buf, s.file_name);

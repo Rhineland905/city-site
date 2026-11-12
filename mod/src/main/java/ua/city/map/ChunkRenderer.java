@@ -43,7 +43,7 @@ final class ChunkRenderer {
 
     /** Увесь чанк з одним зрізом (для перевірок). */
     int[] render(ClientLevel level, int cx, int cz, int sliceTop, int sliceBottom) {
-        return render(level, cx, cz, new SiteApi.Layer("", "", "", sliceTop, sliceBottom, 0, 0, 0, -1, -1, List.of()));
+        return render(level, cx, cz, new SiteApi.Layer("", "", "", sliceTop, sliceBottom, 0, 0, 0, -1, -1, List.of(), null));
     }
 
     /** null, якщо чанк ще не прогружений. */
