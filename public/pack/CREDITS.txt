@@ -1,0 +1,24 @@
+Текстури блоків для 3D без файлу гри / Block textures used in 3D without the game file
+=====================================================================================
+
+public/pack/blocks.png — це текстури з двох відкритих ресурспаків, зібрані в один аркуш
+(перший кадр анімацій, кожна 16×16). Їх змінено лише так: зібрано в аркуш і, де треба,
+пофарбовано кольором біому на сайті. Збирає скрипт scripts/build-open-pack.py.
+Текстури Mojang тут не використовуються.
+
+1. Pixel Perfection Community Edition
+   Автори: XSSheep (оригінал), StonePendant, freejusticehere, Stingraych, Nova_Wostra,
+   lazerl0rd та інші учасники спільноти.
+   Джерело: https://github.com/Athemis/PixelPerfectionCE
+   Ліцензія: CC BY-SA 4.0 — https://creativecommons.org/licenses/by-sa/4.0/
+
+2. VoxeLibre (глибинний сланець, туф, мідь, скалк, аметист, кальцит, бруд, мангри, вишня, бамбук)
+   Автори: учасники VoxeLibre, зокрема NO11 (глибинний сланець, мідь), cora (скалк),
+   Emojiminetest і kay27 (аметист), TheRandomLegoBrick (бруд, CC0), thunder1035 (мангри),
+   PrairieWind, Wbjitscool, SmokeyDope, Nova_Wostra, EmoryNB (вишня), Michieal (бамбук).
+   Більшість текстур VoxeLibre засновано на Pixel Perfection від XSSheep.
+   Джерело: https://github.com/VoxeLibre/VoxeLibre (див. LEGAL.md)
+   Ліцензія: CC BY-SA 4.0 / CC BY-SA 3.0 — https://creativecommons.org/licenses/by-sa/3.0/
+
+Аркуш blocks.png поширюється на тих самих умовах (CC BY-SA).
+Minecraft — торгова марка Mojang AB; цей сайт не пов’язаний із Mojang чи Microsoft.

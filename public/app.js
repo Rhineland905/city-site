@@ -1379,9 +1379,9 @@ async function show3d() {
   try {
     if (v3d.key !== key) {
       v3dStatus('Завантажую 3D-модель міста…');
-      const [{ createViewer }, { pixelBlocks }, buf, colors] = await Promise.all([
+      const [{ createViewer }, { pixelBlocks, pack }, buf, colors] = await Promise.all([
         import('./voxel.js'),
-        import('./pixels.js'),
+        import('./pixels.js').then(async (m) => ({ ...m, pack: await m.loadOpenPack() })),
         fetch(`/api/map/${encodeURIComponent(layer.id)}/model?v=${layer.model.version}`).then((r) => {
           if (!r.ok) throw new Error('модель не знайдено');
           return r.arrayBuffer();
@@ -1398,7 +1398,7 @@ async function show3d() {
       v3d.key = key;
       v3d.baked = v3d.bakedWith = null; // моделі блоків належать попередньому схематику
       // Без файлу гри блоки однаково піксельні: сайт малює їм схожі на гру текстури сам.
-      v3d.pixels = pixelBlocks(schem.states || schem.palette, colors);
+      v3d.pixels = pixelBlocks(schem.states || schem.palette, colors, pack);
       $('#v3dRock').checked = naturalShare(schem) > 0.4;
       const clip = $('#v3dClip');
       clip.min = layer.model.minY;
@@ -1459,9 +1459,10 @@ async function texture3d() {
 function renderTexInfo() {
   const on = !!packs.assets;
   $('#v3dTexBtn').textContent = on ? 'Прибрати текстури' : 'Текстури з гри';
+  $('.v3d-credit').hidden = on; // з файлом гри текстури вже не з паку
   $('#v3dTexInfo').innerHTML = on
     ? `Текстури: ${esc(packName())}. Файл запам’ятано лише в цьому браузері, на сайт він не йде.`
-    : 'Зараз блоки намалював сайт, схоже на гру. Для справжніх текстур і моделей вибери на комп’ютері файл гри: <span class="mono">%APPDATA%\\.minecraft\\versions\\26.3\\26.3.jar</span>. Він читається лише в цьому браузері й нікуди не завантажується.';
+    : 'Зараз текстури з відкритого ресурспаку <a href="/pack/CREDITS.txt" target="_blank" rel="noopener">Pixel Perfection</a>. Для справжніх текстур і моделей вибери на комп’ютері файл гри: <span class="mono">%APPDATA%\\.minecraft\\versions\\26.3\\26.3.jar</span>. Він читається лише в цьому браузері й нікуди не завантажується.';
 }
 renderTexInfo();
 $('#v3dTexBtn').addEventListener('click', async () => {
@@ -1990,13 +1991,13 @@ async function openSchematic(id) {
     return;
   }
   try {
-    const [buf, { createViewer }, { pixelBlocks }, colors] = await Promise.all([
+    const [buf, { createViewer }, { pixelBlocks, pack }, colors] = await Promise.all([
       fetch(`/api/schematics/${s.id}/file?preview`).then((r) => {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.arrayBuffer();
       }),
       import('./voxel.js'),
-      import('./pixels.js'),
+      import('./pixels.js').then(async (m) => ({ ...m, pack: await m.loadOpenPack() })),
       getBlockColors(),
     ]);
     const parsed = await parseSchematic(buf, s.file_name);
@@ -2011,7 +2012,7 @@ async function openSchematic(id) {
     box.innerHTML = '';
     preview = createViewer(box, { fog: false });
     let baked = null;
-    const pixels = pixelBlocks(parsed.states || parsed.palette, colors);
+    const pixels = pixelBlocks(parsed.states || parsed.palette, colors, pack);
     const draw = () => preview.setModel(parsed, { hideNatural: cb.checked, keepView: true, colors, baked: baked || pixels });
     cb.addEventListener('change', draw);
     draw();

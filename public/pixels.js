@@ -381,6 +381,111 @@ function tileFor(name, face, rgb) {
   return T('generic', 0, (t) => t.noise(0.08).noise(0.08, 4));
 }
 
+
+// ---------- Відкритий ресурспак ----------
+// public/pack/blocks.png — текстури Pixel Perfection CE і VoxeLibre (CC BY-SA, автори в public/pack/CREDITS.md),
+// зібрані scripts/build-open-pack.py. Вони вільні для поширення, тож лежать на сайті й працюють у всіх,
+// навіть на телефоні. Чого в паку немає, малюємо самі (малюнки вище).
+let packPromise = null;
+export function loadOpenPack() {
+  packPromise ??= (async () => {
+    const [meta, img] = await Promise.all([
+      fetch('/pack/blocks.json').then((r) => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))),
+      new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = '/pack/blocks.png'; }),
+    ]);
+    const c = document.createElement('canvas');
+    c.width = img.width; c.height = img.height;
+    const g = c.getContext('2d', { willReadFrequently: true });
+    g.drawImage(img, 0, 0);
+    const all = g.getImageData(0, 0, c.width, c.height).data;
+    const size = meta.size, tiles = new Map();
+    for (const [name, [i, tint]] of Object.entries(meta.tiles)) {
+      const ox = (i % meta.cols) * size, oy = Math.floor(i / meta.cols) * size;
+      const px = new Uint8Array(S * S * 4);
+      for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+        const sp = ((oy + y) * c.width + ox + x) * 4, dp = (y * S + x) * 4;
+        px[dp] = all[sp]; px[dp + 1] = all[sp + 1]; px[dp + 2] = all[sp + 2]; px[dp + 3] = all[sp + 3];
+      }
+      tiles.set(name, { px, tint: !!tint });
+    }
+    return tiles;
+  })().catch((e) => { console.warn('Відкритий ресурспак не завантажився:', e); packPromise = null; return null; });
+  return packPromise;
+}
+
+// Колір біому для сірих текстур (як рівнини в грі).
+function tintOf(tex) {
+  if (/^water/.test(tex)) return [63, 118, 228];
+  if (/^birch_leaves/.test(tex)) return [128, 167, 85];
+  if (/^spruce_leaves/.test(tex)) return [97, 153, 97];
+  if (/leaves|vine|lily_pad/.test(tex)) return [119, 171, 47];
+  return [145, 189, 89]; // трава
+}
+
+// Яку текстуру паку взяти для грані блока. Повертає ім'я текстури або null.
+const SPECIES = /^(oak|spruce|birch|jungle|acacia|dark_oak|mangrove|cherry|pale_oak|bamboo|crimson|warped)$/;
+function packBase(n) {
+  let b = n.replace(/^(waxed_|infested_)/, '');
+  let m;
+  if ((m = b.match(/^(\w+?)_(door)$/))) return SPECIES.test(m[1]) || m[1] === 'iron' ? `${m[1]}_door_bottom` : null;
+  if ((m = b.match(/^(\w+?)_trapdoor$/))) return `${m[1]}_trapdoor`;
+  b = b.replace(/_(stairs|slab|wall|fence_gate|fence|pressure_plate|button)$/, '');
+  if (SPECIES.test(b)) return b === 'bamboo' ? 'bamboo_planks' : `${b}_planks`;
+  if (b === 'petrified_oak') return 'oak_planks';
+  if ((m = b.match(/^(stripped_)?(\w+)_wood$/))) return `${m[1] || ''}${m[2]}_log`;
+  if ((m = b.match(/^(stripped_)?(\w+)_hyphae$/))) return `${m[1] || ''}${m[2]}_stem`;
+  if (/_carpet$/.test(b)) return b === 'moss_carpet' ? 'moss_block' : b.replace(/_carpet$/, '_wool');
+  if (/_pane$/.test(b)) return b.replace(/_pane$/, '');
+  const MAP = {
+    quartz: 'quartz_block', smooth_quartz: 'quartz_block_bottom', smooth_sandstone: 'sandstone_top',
+    smooth_red_sandstone: 'red_sandstone_top', brick: 'bricks', purpur: 'purpur_block', snow_block: 'snow',
+    water: 'water_still', bubble_column: 'water_still', lava: 'lava_still', dirt_path: 'dirt_path', grass_path: 'grass_path',
+  };
+  if (MAP[b]) return MAP[b];
+  if (/_brick$/.test(b)) return b + 's';
+  if (/_tile$/.test(b)) return b + 's';
+  return b;
+}
+
+function packTile(n, face, pack) {
+  if (!pack || /lantern|torch|candle|campfire|end_rod|chain$/.test(n)) return null; // у паку це розгортки моделей, не квадрати
+  const base = packBase(n);
+  if (!base) return null;
+  const pick = (...names) => names.find((x) => pack.has(x));
+  let tex;
+  if (face === 'top') tex = pick(`${base}_top`, `${base}_end`, base, `${base}_side`);
+  else if (face === 'bottom') tex = pick(`${base}_bottom`, `${base}_top`, `${base}_end`, base, `${base}_side`);
+  else tex = pick(`${base}_side`, `${base}_front`, base);
+  if (!tex && /_planks$/.test(base)) return null;
+  if (!tex) return null;
+  const overlay = n === 'grass_block' && face === 'side' ? pack.get('grass_block_side_overlay') : null;
+  // Бокові грані колод, стовпів і т. п. — як є; для колоди без _side беремо саму колоду.
+  return {
+    key: `pack|${tex}`, kind: null,
+    make: () => {
+      const t = pack.get(tex), px = t.px.slice();
+      if (/^water/.test(tex)) for (let k = 3; k < px.length; k += 4) px[k] = Math.min(px[k], 180);
+      if (t.tint) { const c = tintOf(tex); for (let k = 0; k < px.length; k += 4) { px[k] = px[k] * c[0] / 255; px[k + 1] = px[k + 1] * c[1] / 255; px[k + 2] = px[k + 2] * c[2] / 255; } }
+      if (overlay) {
+        const c = tintOf('grass'), o = overlay.px;
+        for (let k = 0; k < px.length; k += 4) {
+          if (o[k + 3] < 128) continue;
+          const f = overlay.tint ? c : [255, 255, 255];
+          px[k] = o[k] * f[0] / 255; px[k + 1] = o[k + 1] * f[1] / 255; px[k + 2] = o[k + 2] * f[2] / 255; px[k + 3] = 255;
+        }
+      }
+      return px;
+    },
+  };
+}
+
+// Вид за прозорістю: 0 непрозорий, 1 з дірками, 2 напівпрозорий (як alphaKind у textures.js).
+function alphaKind(px) {
+  let clear = 0, semi = 0;
+  for (let k = 3; k < px.length; k += 4) { if (px[k] === 0) clear++; else if (px[k] < 255) semi++; }
+  return semi > (px.length / 4) * 0.15 ? 2 : clear + semi ? 1 : 0;
+}
+
 // ---------- Форма блоків ----------
 // Неповні блоки — коробки в клітинці 1×1×1: [x0, y0, z0, x1, y1, z1].
 const SKIP = /^(air|cave_air|void_air|light|barrier|structure_void|moving_piston|tripwire|tripwire_hook|string|cobweb|vine|glow_lichen|sculk_vein|ladder|lever|rail|powered_rail|detector_rail|activator_rail|redstone_wire|frogspawn|.*_sign|.*_banner|.*_head|.*_skull|.*_coral_fan|.*_coral_wall_fan|.*_button)$/;
@@ -495,14 +600,15 @@ function shapeOf(q) {
 
 // Стани блоків схематика → { blocks, atlas, pixels: true } як у bakeBlocks.
 // colors — середні кольори з /api/colors ({ ім’я: ['#верх', '#бік'] }), інакше таблиця з blocks.js.
-export function pixelBlocks(states, colors = null) {
+// pack — текстури відкритого ресурспаку (loadOpenPack) або null.
+export function pixelBlocks(states, colors = null, pack = null) {
   const index = new Map(), list = [];
   const layer = (t) => {
     let i = index.get(t.key);
     if (i === undefined) { i = list.length; list.push(t); index.set(t.key, i); }
     return i;
   };
-  const byName = new Map();
+  const byName = new Map(), made = new Map();
   const blocks = states.map((state) => {
     const name = (state || 'minecraft:air').replace(/\[.*$/, '');
     const n = name.replace(/^minecraft:/, '');
@@ -514,9 +620,16 @@ export function pixelBlocks(states, colors = null) {
     const pair = colors && colors[name];
     const hexTop = pair ? parseInt(pair[0].slice(1), 16) : blockColor(name);
     const hexSide = pair ? parseInt(pair[1].slice(1), 16) : hexTop;
-    const top = tileFor(name, 'top', rgbOf(hexTop));
-    const side = tileFor(name, 'side', rgbOf(hexSide));
-    const bottom = tileFor(name, 'bottom', rgbOf(hexTop));
+    const tex = (face, rgb) => {
+      const t = packTile(n, face, pack);
+      if (!t) return tileFor(name, face, rgb);
+      let px = made.get(t.key);
+      if (!px) { px = t.make(); made.set(t.key, px); }
+      return { key: t.key, kind: /^(water|bubble_column)$/.test(n) ? 2 : alphaKind(px), make: () => px };
+    };
+    const top = tex('top', rgbOf(hexTop));
+    const side = tex('side', rgbOf(hexSide));
+    const bottom = tex('bottom', rgbOf(hexTop));
     const tl = [layer(top), layer(side), layer(bottom)];
     const kinds = [top.kind, side.kind, bottom.kind];
     const q = [];
