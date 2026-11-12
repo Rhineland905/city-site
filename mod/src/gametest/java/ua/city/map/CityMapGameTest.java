@@ -126,7 +126,7 @@ public class CityMapGameTest implements FabricClientGameTest {
         // Області: велика з основним зрізом на всі 9 чанків і мала на чанку 266 96 нижче (без даху кімнати).
         SiteApi.Layer layer = new SiteApi.Layer("t", "t", "overworld", -37, -53, 0, 0, 0, -1, -1, List.of(
             new SiteApi.Area(4224, 1520, 4271, 1567, -37, -53),
-            new SiteApi.Area(4256, 1536, 4271, 1551, -51, -60)));
+            new SiteApi.Area(4256, 1536, 4271, 1551, -51, -60)), null);
         for (int cz = 95; cz <= 97; cz++) {
             for (int cx = 264; cx <= 266; cx++) {
                 if (!layer.touches(cx, cz)) throw new IllegalStateException("area does not touch " + cx + " " + cz);

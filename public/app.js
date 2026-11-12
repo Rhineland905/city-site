@@ -1510,6 +1510,9 @@ async function show3d() {
       v3d.baked = v3d.bakedWith = null; // моделі блоків належать попередньому схематику
       // Без файлу гри блоки однаково піксельні: сайт малює їм схожі на гру текстури сам.
       v3d.pixels = pixelBlocks(schem.states || schem.palette, colors, pack);
+      // Що гравці збудували після схематика: блоки чанків, які надіслав мод.
+      v3d.blocksSince = 0;
+      await syncBlocks3d(key, true);
       $('#v3dRock').checked = naturalShare(schem) > 0.4;
       const clip = $('#v3dClip');
       clip.min = layer.model.minY;
@@ -1526,6 +1529,105 @@ async function show3d() {
     v3dStatus('Не вдалося відкрити 3D: ' + err.message);
   }
 }
+
+// ---------- 3D оновлюється від мода ----------
+// Мод надсилає блоки чанків у межах моделі (gzip: i16 minY, u16 висота, u16 розмір палітри, стани блоків,
+// далі номери в палітрі в порядку x + z*16 + y*256). Вставляємо їх у схематик поверх того, що було у файлі.
+async function gunzipBytes(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+// Повертає, скільки блоків схематика змінилося.
+function applyChunkBlocks(schem, layer, cx, cz, raw) {
+  const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  const minY = dv.getInt16(0), h = dv.getUint16(2), count = dv.getUint16(4);
+  const dec = new TextDecoder();
+  let o = 6;
+  schem.states ||= schem.palette.slice();
+  schem.stateIndex ||= new Map(schem.states.map((st, i) => [st, i]));
+  const ids = new Array(count);
+  for (let i = 0; i < count; i++) {
+    const n = dv.getUint16(o);
+    const st = dec.decode(raw.subarray(o + 2, o + 2 + n));
+    o += 2 + n;
+    let id = schem.stateIndex.get(st);
+    if (id === undefined) {
+      if (schem.states.length >= 65535) { ids[i] = -1; continue; }
+      id = schem.states.length;
+      schem.states.push(st);
+      schem.palette.push(st.replace(/\[.*$/, ''));
+      schem.stateIndex.set(st, id);
+    }
+    ids[i] = id;
+  }
+  const wide = count > 256;
+  if (raw.length < o + h * 256 * (wide ? 2 : 1)) throw new Error('обрізані блоки чанка');
+  const { width: W, height: H, length: L, blocks } = schem;
+  const x0 = cx * 16 - layer.originX, z0 = cz * 16 - layer.originZ, y0 = minY - layer.model.minY;
+  let changed = 0;
+  for (let ly = 0; ly < h; ly++) {
+    const y = y0 + ly;
+    if (y < 0 || y >= H) continue;
+    for (let lz = 0; lz < 16; lz++) {
+      const z = z0 + lz;
+      if (z < 0 || z >= L) continue;
+      for (let lx = 0; lx < 16; lx++) {
+        const x = x0 + lx;
+        if (x < 0 || x >= W) continue;
+        const k = o + (lx + lz * 16 + ly * 256) * (wide ? 2 : 1);
+        const id = ids[wide ? dv.getUint16(k) : raw[k]];
+        const i = x + z * W + y * W * L;
+        if (id >= 0 && blocks[i] !== id) { blocks[i] = id; changed++; }
+      }
+    }
+  }
+  return changed;
+}
+// Забирає з сайту блоки чанків, змінені після v3d.blocksSince. first — перше завантаження (місто ще не збудоване).
+async function syncBlocks3d(key, first) {
+  const layer = v3d.layer, schem = v3d.schem;
+  if (!layer?.live || !schem || v3d.blocksBusy) return;
+  v3d.blocksBusy = true;
+  try {
+    let changed = 0, since = v3d.blocksSince, offset = 0;
+    for (;;) {
+      const r = await fetch(`/api/live/${encodeURIComponent(layer.id)}/blocks?since=${v3d.blocksSince}&offset=${offset}`);
+      if (!r.ok) break;
+      const buf = new Uint8Array(await r.arrayBuffer());
+      const dv = new DataView(buf.buffer);
+      let o = 0, n = 0;
+      while (o + 20 <= buf.length) {
+        const cx = dv.getInt32(o), cz = dv.getInt32(o + 4), at = dv.getFloat64(o + 8), len = dv.getUint32(o + 16);
+        try {
+          const raw = await gunzipBytes(buf.subarray(o + 20, o + 20 + len));
+          if (v3d.key !== key) return;
+          changed += applyChunkBlocks(schem, layer, cx, cz, raw);
+        } catch (e) { console.warn('Блоки чанка', cx, cz, e); }
+        since = Math.max(since, at + 1);
+        o += 20 + len;
+        n++;
+      }
+      offset += n;
+      if (r.headers.get('x-more') !== '1' || !n) break;
+    }
+    v3d.blocksSince = since;
+    if (!changed || v3d.key !== key) return;
+    // Блоки змінилися: текстури й моделі блоків рахуємо заново (могли з’явитися нові стани).
+    const { pixelBlocks, loadOpenPack } = await import('./pixels.js');
+    v3d.pixels = pixelBlocks(schem.states, v3d.colors, await loadOpenPack());
+    packs.baked.delete(schem);
+    v3d.baked = v3d.bakedWith = null;
+    if (!first) { build3d(true); markers3d(); texture3d(); }
+  } catch (e) {
+    console.warn('3D: блоки з мода не завантажились', e);
+  } finally {
+    v3d.blocksBusy = false;
+  }
+}
+// Поки відкрито 3D, раз на хвилину питаємо, чи не збудували щось нове.
+setInterval(() => {
+  if (v3d.mode === '3d' && v3d.key && !document.hidden) syncBlocks3d(v3d.key, false);
+}, 60_000);
 
 function build3d(keepView) {
   const model = v3d.viewer.setModel(v3d.schem, {
@@ -1990,6 +2092,7 @@ $('#fromSchemForm').addEventListener('submit', (e) => {
       fd.set('height', canvas.height);
       fd.set('model', fromSchem.file);
       fd.set('modelMinY', form.minY.value);
+      if (fromSchem.schem?.height) fd.set('modelHeight', fromSchem.schem.height);
       fd.set('sliceTop', form.topY.value);
       fd.set('sliceBottom', form.bottomY.value);
       if (tx) fd.set('colors', JSON.stringify(tx.blockColors(fromSchem.schem, fromSchem.tiles)));

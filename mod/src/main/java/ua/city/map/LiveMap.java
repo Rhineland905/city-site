@@ -9,6 +9,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
 
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -33,7 +34,7 @@ import java.util.function.Consumer;
  * стиснення в PNG і мережа — в окремому потоці, щоб гра не підвисала.
  */
 final class LiveMap {
-    private static final long TICK_BUDGET_NS = 4_000_000L; // не більше ~4 мс на кадр гри
+    private static final long TICK_BUDGET_NS = 2_000_000L; // не більше ~2 мс на такт гри (такт триває 50 мс)
     private static final long NEIGHBOUR_WAIT_MS = 10_000;  // чекаємо сусідів, щоб краї чанка вийшли правильними
     private static final long NEAR_SCAN_MS = 20_000;       // поруч із гравцем перемальовуємо часто: там будують
     private static final long FULL_SCAN_MS = 180_000;
@@ -70,7 +71,13 @@ final class LiveMap {
     private final Map<String, Long> epochs = new HashMap<>();
     private final Map<String, Long> since = new HashMap<>();
     private final Map<String, LinkedHashMap<Long, Pending>> pending = new HashMap<>();
+    // Блоки для 3D: що лежить на сайті (хеші), що чекає відправки, версія моделі шару.
+    private final Map<String, Map<Long, String>> blocksKnown = new HashMap<>();
+    private final Map<String, LinkedHashMap<Long, BlockSync.Encoded>> blocksPending = new HashMap<>();
+    private final Map<String, Long> blocksSince = new HashMap<>();
+    private final Map<String, Long> modelVersions = new HashMap<>();
     private long nextTry;
+    private long nextBlocks;
     private int failures;
     private boolean authFailed;
     private boolean firstUploadShown;
@@ -78,6 +85,7 @@ final class LiveMap {
 
     // ---- лічильники для /citymap ----
     private final AtomicInteger sent = new AtomicInteger();
+    private final AtomicInteger sentBlocks = new AtomicInteger();
     private final AtomicInteger unchanged = new AtomicInteger();
     private final AtomicInteger waiting = new AtomicInteger();
     private final AtomicBoolean flushQueued = new AtomicBoolean();
@@ -182,6 +190,13 @@ final class LiveMap {
                 if (!l.dimension().equals(dim) || !l.touches(cx, cz)) continue;
                 int[] img = renderer.render(level, cx, cz, l);
                 if (img != null) submit(l, cx, cz, img);
+                // Для 3D на сайті: швидка копія секцій чанка, решта роботи — у фоновому потоці.
+                SiteApi.Model m = l.model();
+                if (img != null && m != null && m.touches(cx, cz)) {
+                    LevelChunk chunk = level.getChunkSource().getChunk(cx, cz, ChunkStatus.FULL, false);
+                    BlockSync.Capture cap = chunk == null ? null : BlockSync.capture(chunk, cx, cz, m.minY(), m.maxY());
+                    if (cap != null) submitBlocks(l.id(), cap);
+                }
             }
             done++;
         }
@@ -235,6 +250,74 @@ final class LiveMap {
         });
     }
 
+    private void submitBlocks(String layer, BlockSync.Capture cap) {
+        int s = session;
+        waiting.incrementAndGet();
+        worker.execute(() -> {
+            try {
+                if (s != session) return;
+                BlockSync.Encoded e = BlockSync.encode(cap);
+                long k = key(cap.cx(), cap.cz());
+                LinkedHashMap<Long, BlockSync.Encoded> list = blocksPending.computeIfAbsent(layer, x -> new LinkedHashMap<>());
+                list.remove(k);
+                if (hex(e.hash()).equals(blocksKnown.computeIfAbsent(layer, x -> new HashMap<>()).get(k))) return; // на сайті вже це
+                list.put(k, e);
+                while (list.size() > MAX_PENDING) {
+                    Iterator<Long> it = list.keySet().iterator();
+                    it.next();
+                    it.remove();
+                }
+            } catch (RuntimeException e) {
+                CityMapClient.LOG.warn("Жива мапа: не вдалося підготувати блоки чанка {} {}: {}", cap.cx(), cap.cz(), e.toString());
+            } finally {
+                waiting.decrementAndGet();
+            }
+        });
+    }
+
+    /** Блоки для 3D ідуть після картинок і без поспіху: пакетами раз на кілька секунд. false — помилка, чекаємо. */
+    private boolean flushBlocks(String layer, LinkedHashMap<Long, BlockSync.Encoded> list, boolean force) {
+        while (!list.isEmpty()) {
+            if (!force && list.size() < BATCH && System.currentTimeMillis() < nextBlocks) return true;
+            List<BlockSync.Encoded> batch = new ArrayList<>();
+            int bytes = 6;
+            for (BlockSync.Encoded e : list.values()) {
+                if (batch.size() >= BATCH || (!batch.isEmpty() && bytes + e.gzip().length > BATCH_BYTES)) break;
+                batch.add(e);
+                bytes += 28 + e.gzip().length;
+            }
+            ByteBuffer bb = ByteBuffer.allocate(bytes);
+            bb.put("CMB1".getBytes(StandardCharsets.US_ASCII)).putShort((short) batch.size());
+            for (BlockSync.Encoded e : batch) bb.putInt(e.cx()).putInt(e.cz()).put(e.hash()).putInt(e.gzip().length).put(e.gzip());
+            try {
+                JsonObject r = SiteApi.uploadBlocks(cfg.site, layer, cfg.key, bb.array());
+                Map<Long, String> k = blocksKnown.computeIfAbsent(layer, x -> new HashMap<>());
+                for (BlockSync.Encoded e : batch) {
+                    k.put(key(e.cx(), e.cz()), hex(e.hash()));
+                    list.remove(key(e.cx(), e.cz()), e);
+                }
+                sentBlocks.addAndGet(r.has("saved") ? r.get("saved").getAsInt() : batch.size());
+                nextBlocks = System.currentTimeMillis() + 5_000;
+                failures = 0;
+            } catch (SiteApi.HttpError e) {
+                if (e.status == 401 || e.status == 404 || e.status == 409 || e.status == 400 || e.status == 413) {
+                    // Ключ, шар чи пакет не підходять: про ключ скаже відправка картинок, а блоки просто не шлемо.
+                    CityMapClient.LOG.warn("Жива мапа: сайт не взяв блоки для 3D: {}", e.getMessage());
+                    list.clear();
+                    return true;
+                }
+                lastError = e.getMessage();
+                backoff();
+                return false;
+            } catch (Exception e) {
+                lastError = e.getMessage() == null ? e.toString() : e.getMessage();
+                backoff();
+                return false;
+            }
+        }
+        return true;
+    }
+
     private void prepare(SiteApi.Layer l, int cx, int cz, int[] img, int s) {
         if (s != session) return;
         byte[] hash = hash16(img);
@@ -275,6 +358,9 @@ final class LiveMap {
         if (authFailed || System.currentTimeMillis() < nextTry) return;
         for (Map.Entry<String, LinkedHashMap<Long, Pending>> e : new ArrayList<>(pending.entrySet())) {
             if (!flushLayer(e.getKey(), e.getValue(), force)) return;
+        }
+        for (Map.Entry<String, LinkedHashMap<Long, BlockSync.Encoded>> e : new ArrayList<>(blocksPending.entrySet())) {
+            if (!flushBlocks(e.getKey(), e.getValue(), force)) return;
         }
     }
 
@@ -379,6 +465,13 @@ final class LiveMap {
                         since.remove(l.id());
                         pending.remove(l.id());
                     }
+                    long mv = l.model() == null ? -1 : l.model().v();
+                    Long old = modelVersions.put(l.id(), mv);
+                    if (old == null || old != mv) { // на сайт поклали інший схематик: блоки надсилаємо заново
+                        blocksKnown.remove(l.id());
+                        blocksPending.remove(l.id());
+                        blocksSince.remove(l.id());
+                    }
                     SiteApi.Index idx = SiteApi.index(site, l.id(), since.getOrDefault(l.id(), 0L));
                     Map<Long, String> k = known.computeIfAbsent(l.id(), x -> new HashMap<>());
                     long max = since.getOrDefault(l.id(), 0L);
@@ -387,6 +480,8 @@ final class LiveMap {
                         max = Math.max(max, t.at());
                     }
                     since.put(l.id(), max);
+                    Map<Long, String> bk = blocksKnown.computeIfAbsent(l.id(), x -> new HashMap<>());
+                    for (SiteApi.Tile t : idx.blocks()) bk.put(key(t.cx(), t.cz()), t.hash());
                 }
                 if (verify) verifyKey(site, key, name, ls);
                 Minecraft.getInstance().execute(() -> {
@@ -540,6 +635,7 @@ final class LiveMap {
         int inQueue = queue.size() + waiting.get();
         out.accept(Component.literal("Надіслано за сесію: " + chunks(sent.get()) + ", без змін: " + unchanged.get()
             + (inQueue > 0 ? ", у черзі: " + inQueue : "")));
+        if (sentBlocks.get() > 0) out.accept(Component.literal("Для 3D надіслано блоки: " + chunks(sentBlocks.get())).withStyle(ChatFormatting.GRAY));
         if (!lastError.isEmpty()) out.accept(Component.literal("Остання помилка: " + lastError).withStyle(ChatFormatting.RED));
     }
 

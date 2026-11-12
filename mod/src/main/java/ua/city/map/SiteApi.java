@@ -21,7 +21,7 @@ import java.util.Map;
 final class SiteApi {
     private SiteApi() {}
 
-    static final String USER_AGENT = "CityMap/1.0 (Minecraft mod)";
+    static final String USER_AGENT = "CityMap/1.1 (Minecraft mod)";
 
     /** Область, яку редактор додав на сайті: межі в блоках (рівно по чанках, включно) і свій зріз. */
     record Area(int minX, int minZ, int maxX, int maxZ, int top, int bottom) {
@@ -39,9 +39,17 @@ final class SiteApi {
         }
     }
 
-    /** Шар мапи, для якого на сайті ввімкнена жива мапа. Межі в блоках, включно, плюс області. */
+    /** Коробка 3D-моделі шару у світі (включно). У її межах сайт чекає ще й самі блоки. v — версія моделі. */
+    record Model(int minX, int minZ, int maxX, int maxZ, int minY, int maxY, long v) {
+        boolean touches(int cx, int cz) {
+            int x0 = cx << 4, z0 = cz << 4;
+            return x0 + 15 >= minX && x0 <= maxX && z0 + 15 >= minZ && z0 <= maxZ;
+        }
+    }
+
+    /** Шар мапи, для якого на сайті ввімкнена жива мапа. Межі в блоках, включно, плюс області. model — null, якщо 3D немає. */
     record Layer(String id, String name, String dimension, int top, int bottom, long epoch,
-                 int minX, int minZ, int maxX, int maxZ, List<Area> areas) {
+                 int minX, int minZ, int maxX, int maxZ, List<Area> areas, Model model) {
         boolean touches(int cx, int cz) {
             int x0 = cx << 4, z0 = cz << 4;
             if (x0 + 15 >= minX && x0 <= maxX && z0 + 15 >= minZ && z0 <= maxZ) return true;
@@ -61,7 +69,7 @@ final class SiteApi {
 
     record Tile(int cx, int cz, String hash, long at) {}
 
-    record Index(boolean live, long epoch, List<Tile> tiles) {}
+    record Index(boolean live, long epoch, List<Tile> tiles, List<Tile> blocks) {}
 
     /** Помилка з відповіддю сайту: код і текст, який сайт показав би людині. */
     static final class HttpError extends IOException {
@@ -86,10 +94,16 @@ final class SiteApi {
                         a.get("maxZ").getAsInt(), a.get("top").getAsInt(), a.get("bottom").getAsInt()));
                 }
             }
+            Model model = null;
+            if (l.has("model") && l.get("model").isJsonObject()) {
+                JsonObject m = l.getAsJsonObject("model");
+                model = new Model(m.get("minX").getAsInt(), m.get("minZ").getAsInt(), m.get("maxX").getAsInt(), m.get("maxZ").getAsInt(),
+                    m.get("minY").getAsInt(), m.get("maxY").getAsInt(), m.has("v") ? m.get("v").getAsLong() : 0);
+            }
             out.add(new Layer(l.get("id").getAsString(), l.get("name").getAsString(), l.get("dimension").getAsString(),
                 l.get("top").getAsInt(), l.get("bottom").getAsInt(), l.has("epoch") ? l.get("epoch").getAsLong() : 0,
                 l.get("minX").getAsInt(), l.get("minZ").getAsInt(), l.get("maxX").getAsInt(), l.get("maxZ").getAsInt(),
-                List.copyOf(areas)));
+                List.copyOf(areas), model));
         }
         return out;
     }
@@ -107,7 +121,14 @@ final class SiteApi {
                 tiles.add(new Tile(t.get(0).getAsInt(), t.get(1).getAsInt(), t.get(2).getAsString(), t.get(3).getAsLong()));
             }
         }
-        return new Index(on, epoch, tiles);
+        List<Tile> blocks = new ArrayList<>();
+        if (o.has("blocks") && o.get("blocks").isJsonArray()) {
+            for (JsonElement e : o.getAsJsonArray("blocks")) {
+                JsonArray t = e.getAsJsonArray();
+                blocks.add(new Tile(t.get(0).getAsInt(), t.get(1).getAsInt(), t.get(2).getAsString(), t.get(3).getAsLong()));
+            }
+        }
+        return new Index(on, epoch, tiles, blocks);
     }
 
     /** Надсилає пакет чанків. Відповідь сайту: {saved, unchanged, outside}. */
@@ -115,6 +136,13 @@ final class SiteApi {
         return json(request("POST", site + "/api/live/" + enc(layer), Map.of(
             "x-live-key", key,
             "x-player", player,
+            "content-type", "application/octet-stream"), body));
+    }
+
+    /** Надсилає блоки чанків для 3D. Відповідь сайту: {saved, unchanged, outside}. */
+    static JsonObject uploadBlocks(String site, String layer, String key, byte[] body) throws IOException {
+        return json(request("POST", site + "/api/live/" + enc(layer) + "/blocks", Map.of(
+            "x-live-key", key,
             "content-type", "application/octet-stream"), body));
     }
 

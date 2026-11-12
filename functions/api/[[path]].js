@@ -260,6 +260,14 @@ const LIVE_MAX_AREAS = 32;
 // Усі області шару разом: чанк важить десятки КБ, а база D1 на безкоштовному плані вміщує 500 МБ.
 const LIVE_AREA_CHUNKS = 4096;
 const MINI_BYTES = 16 * 16 * 4;
+// Блоки чанків для 3D: мод присилає їх стиснутими (gzip), сайт зберігає як є, а браузер вставляє в модель міста.
+const BLOCKS_SCHEMA = `CREATE TABLE IF NOT EXISTS live_blocks (
+    layer TEXT NOT NULL, cx INTEGER NOT NULL, cz INTEGER NOT NULL,
+    hash TEXT NOT NULL, data BLOB NOT NULL, updated_at INTEGER NOT NULL,
+    PRIMARY KEY (layer, cx, cz))`;
+const BLOCKS_MAX_CHUNK = 256 * 1024; // один чанк стиснутим: зазвичай 1–10 КБ
+const BLOCKS_PAGE = 64;              // стільки чанків віддаємо браузеру за раз
+const MODEL_DEFAULT_HEIGHT = 128;    // старі шари не знають висоти свого схематика
 
 // Таблицы создаются сами при первом запросе, вручную ничего выполнять не нужно.
 const SCHEMA = [
@@ -294,6 +302,8 @@ const SCHEMA = [
   'CREATE INDEX IF NOT EXISTS sessions_user ON sessions (user_id)',
   LIVE_SCHEMA,
   'CREATE INDEX IF NOT EXISTS live_tiles_updated ON live_tiles (layer, updated_at)',
+  BLOCKS_SCHEMA,
+  'CREATE INDEX IF NOT EXISTS live_blocks_updated ON live_blocks (layer, updated_at)',
 ];
 // Типи міток. Підписи й значки задає сайт (app.js), тут лише список дозволених.
 const MARKER_KINDS = ['home', 'farm', 'storage', 'mine', 'portal', 'shop', 'danger', 'other'];
@@ -771,6 +781,8 @@ async function map(request, env, method, id, action) {
       const minY = int(form.get('modelMinY'));
       if (minY === null) return fail(400, 'Вкажи нижню висоту схематика');
       modelInfo = { fileName: str(model.name, 200), format: ext, minY, version: Date.now() };
+      const modelHeight = int(form.get('modelHeight'));
+      if (modelHeight > 0 && modelHeight <= 4096) modelInfo.height = modelHeight;
       // Зріз, з якого намальована мапа: наступного разу діалог підставить його сам.
       const sliceTop = int(form.get('sliceTop')), sliceBottom = int(form.get('sliceBottom'));
       if (sliceTop !== null && sliceBottom !== null) Object.assign(modelInfo, { sliceTop, sliceBottom });
@@ -791,6 +803,8 @@ async function map(request, env, method, id, action) {
     }
     if (hasModel) await env.FILES.put(`model:${layer.id}`, await model.arrayBuffer());
     else if (!modelInfo && existing?.model) await env.FILES.delete(`model:${layer.id}`);
+    // Новий схематик свіжіший за все, що прислав мод: старі блоки чанків більше не потрібні.
+    if (existing && (hasModel || !modelInfo)) await env.DB.prepare('DELETE FROM live_blocks WHERE layer = ?').bind(layer.id).run();
     await saveLayers(env, existing ? layers.map((l) => (l.id === layer.id ? layer : l)) : [...layers, layer]);
     const colors = form.get('colors');
     if (typeof colors === 'string' && colors) await mergeColors(env, colors);
@@ -803,6 +817,7 @@ async function map(request, env, method, id, action) {
     await env.FILES.delete(`map:${id}`);
     await env.FILES.delete(`model:${id}`);
     await env.DB.prepare('DELETE FROM live_tiles WHERE layer = ?').bind(id).run();
+    await env.DB.prepare('DELETE FROM live_blocks WHERE layer = ?').bind(id).run();
     await saveLayers(env, layers.filter((l) => l.id !== id));
     return json({ ok: true });
   }
@@ -817,10 +832,20 @@ const layerBox = (l) => ({
   maxX: Math.ceil(l.originX + l.width * l.scale) + LIVE_MARGIN - 1,
   maxZ: Math.ceil(l.originZ + l.height * l.scale) + LIVE_MARGIN - 1,
 });
+// Коробка 3D-моделі шару у світі: у її межах мод надсилає ще й самі блоки, щоб 3D оновлювалося.
+function modelBox(l) {
+  if (!l.model) return null;
+  return {
+    minX: l.originX, minZ: l.originZ,
+    maxX: Math.ceil(l.originX + l.width * l.scale) - 1, maxZ: Math.ceil(l.originZ + l.height * l.scale) - 1,
+    minY: l.model.minY, maxY: l.model.minY + (l.model.height || MODEL_DEFAULT_HEIGHT) - 1, v: l.model.version,
+  };
+}
 function liveLayers(layers) {
   return layers.filter((l) => l.live).map((l) => ({
     id: l.id, name: l.name, dimension: l.dimension, top: l.live.top, bottom: l.live.bottom, epoch: l.live.epoch || 0,
     ...layerBox(l),
+    model: modelBox(l),
     areas: (l.liveAreas || []).map(({ minX, minZ, maxX, maxZ, top, bottom }) => ({ minX, minZ, maxX, maxZ, top, bottom })),
   }));
 }
@@ -932,9 +957,13 @@ async function live(request, env, method, parts, waitUntil) {
     const { results } = await env.DB.prepare(
       'SELECT cx, cz, hash, updated_at, player FROM live_tiles WHERE layer = ? AND updated_at >= ?'
     ).bind(id, since).all();
+    const blocks = layer.model ? (await env.DB.prepare(
+      'SELECT cx, cz, hash, updated_at FROM live_blocks WHERE layer = ? AND updated_at >= ?'
+    ).bind(id, since).all()).results : [];
     return new Response(JSON.stringify({
       live: layer.live || null,
       tiles: results.map((r) => [r.cx, r.cz, r.hash, r.updated_at, r.player]),
+      blocks: blocks.map((r) => [r.cx, r.cz, r.hash, r.updated_at]),
     }), { headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' } });
   }
 
@@ -972,6 +1001,65 @@ async function live(request, env, method, parts, waitUntil) {
     });
     if (fresh && cache && waitUntil) waitUntil(cache.put(request, res.clone()).catch(() => {}));
     return res;
+  }
+
+  // Блоки чанків для 3D одним шматком: i32 cx, i32 cz, f64 час, u32 довжина і gzip-дані на кожен.
+  // Віддаємо сторінками за часом зміни; заголовок x-more каже, що є ще.
+  if (method === 'GET' && action === 'blocks') {
+    const offset = Math.max(0, int(new URL(request.url).searchParams.get('offset')) || 0);
+    const { results } = await env.DB.prepare(
+      'SELECT cx, cz, data, updated_at FROM live_blocks WHERE layer = ? AND updated_at >= ? ORDER BY updated_at, cx, cz LIMIT ? OFFSET ?'
+    ).bind(id, since, BLOCKS_PAGE + 1, offset).all();
+    const page = results.slice(0, BLOCKS_PAGE).map((r) => ({ ...r, data: new Uint8Array(r.data) }));
+    const out = new Uint8Array(page.reduce((n, r) => n + 20 + r.data.length, 0));
+    const dv = new DataView(out.buffer);
+    let o = 0;
+    for (const r of page) {
+      dv.setInt32(o, r.cx); dv.setInt32(o + 4, r.cz); dv.setFloat64(o + 8, r.updated_at); dv.setUint32(o + 16, r.data.length);
+      out.set(r.data, o + 20);
+      o += 20 + r.data.length;
+    }
+    return new Response(out, { headers: {
+      'content-type': 'application/octet-stream', 'cache-control': 'no-store', 'x-more': results.length > BLOCKS_PAGE ? '1' : '0',
+    } });
+  }
+
+  // Мод надсилає блоки чанків: "CMB1", u16 кількість, далі i32 cx, i32 cz, 16 байт хешу, u32 довжина, gzip.
+  if (method === 'POST' && action === 'blocks') {
+    if (!(await liveKeyOk(request, env))) return fail(401, 'Ключ мода не підходить');
+    if (!layer.live) return fail(409, 'Для цього шару жива мапа вимкнена');
+    const box = modelBox(layer);
+    if (!box) return fail(409, 'У цього шару немає 3D-моделі');
+    if (Number(request.headers.get('content-length') || 0) > LIVE_MAX_BODY) return fail(413, 'Завеликий запит');
+    const buf = await request.arrayBuffer();
+    if (buf.byteLength > LIVE_MAX_BODY) return fail(413, 'Завеликий запит');
+    const dv = new DataView(buf), bytes = new Uint8Array(buf);
+    if (buf.byteLength < 6 || String.fromCharCode(...bytes.subarray(0, 4)) !== 'CMB1') return fail(400, 'Невідомий формат');
+    const count = dv.getUint16(4);
+    if (count > LIVE_MAX_TILES) return fail(400, `Не більше ${LIVE_MAX_TILES} чанків за раз`);
+    const cb = chunkBox(box);
+    const ok = [];
+    let o = 6;
+    for (let i = 0; i < count; i++) {
+      if (o + 28 > buf.byteLength) return fail(400, 'Обрізаний запит');
+      const cx = dv.getInt32(o), cz = dv.getInt32(o + 4), hash = toHex(bytes.subarray(o + 8, o + 24)), n = dv.getUint32(o + 24);
+      o += 28;
+      if (n > BLOCKS_MAX_CHUNK || o + n > buf.byteLength) return fail(400, 'Завеликий чанк');
+      if (n < 18 || bytes[o] !== 0x1f || bytes[o + 1] !== 0x8b) return fail(400, 'Блоки чанка мають бути стиснуті gzip');
+      if (inBox(cb, cx, cz)) ok.push({ cx, cz, hash, data: buf.slice(o, o + n) });
+      o += n;
+    }
+    const now = Date.now();
+    let saved = 0;
+    if (ok.length) {
+      const res = await env.DB.batch(ok.map((t) => env.DB.prepare(
+        `INSERT INTO live_blocks (layer, cx, cz, hash, data, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(layer, cx, cz) DO UPDATE SET hash = excluded.hash, data = excluded.data, updated_at = excluded.updated_at
+         WHERE live_blocks.hash <> excluded.hash`
+      ).bind(id, t.cx, t.cz, t.hash, t.data, now)));
+      saved = res.reduce((n, r) => n + (r.meta?.changes || 0), 0);
+    }
+    return json({ saved, unchanged: ok.length - saved, outside: count - ok.length });
   }
 
   if (method === 'POST' && !action) {
