@@ -221,6 +221,7 @@ const QUAD = 24;
 const DIRS = [[0, 1, 0], [0, -1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]]; // верх низ север юг запад восток
 const LIFT = 1.25; // город из глубинного сланца тёмный: чуть высветляем, как и цветную модель
 const GLOW = 1.2; // яркость светящихся блоков: лампы, фонари, лава
+const AO = [0.5, 0.66, 0.82, 1]; // тень в углу: 0 — угол зажат с трёх сторон, 3 — открыт
 
 // Растущий типизированный массив.
 class Grow {
@@ -244,18 +245,22 @@ class TexBuilder {
     this.lb = new Grow(Uint16Array);
     this.quads = 0;
   }
-  quad(q, o, x, y, z, light) {
+  // ao — затінення чотирьох кутів (1 — без тіні) або null. Якщо тінь лягає по діагоналі,
+  // чотирикутник ділимо навпаки, щоб вона не перетворювалася на смугу, як у грі.
+  quad(q, o, x, y, z, light, ao = null) {
     const s = this.s, P = this.pos, U = this.uv, B = this.lb;
     P.room(12); U.room(8); B.room(8);
-    const layer = q[o + 20], l = Math.min(65535, Math.round(light * 256));
-    for (let k = 0; k < 4; k++) {
+    const layer = q[o + 20];
+    const first = ao && ao[0] + ao[2] < ao[1] + ao[3] ? 1 : 0;
+    for (let j = 0; j < 4; j++) {
+      const k = (j + first) & 3;
       P.a[P.n++] = Math.round((x + q[o + k * 3]) * s);
       P.a[P.n++] = Math.round((y + q[o + k * 3 + 1]) * s);
       P.a[P.n++] = Math.round((z + q[o + k * 3 + 2]) * s);
       U.a[U.n++] = Math.round(Math.min(1, Math.max(0, q[o + 12 + k * 2])) * 65535);
       U.a[U.n++] = Math.round(Math.min(1, Math.max(0, q[o + 13 + k * 2])) * 65535);
       B.a[B.n++] = layer;
-      B.a[B.n++] = l;
+      B.a[B.n++] = Math.min(65535, Math.round(light * (ao ? ao[k] : 1) * 256));
     }
     this.quads++;
   }
@@ -331,6 +336,31 @@ function buildTextured(schem, baked, atlas, { hideNatural, clippingPlanes }) {
   const glowPos = new Buf(1024), glowCol = new Buf(1024);
   let faces = 0;
 
+  // Тіні в кутах, як «плавне освітлення» у грі: кут грані темнішає, якщо біля нього
+  // стоять суцільні блоки. Для кожного кута дивимося на два бічні сусіди й діагонального.
+  const occ = (x, y, z) => x >= 0 && y >= 0 && z >= 0 && x < W && y < H && z < L && solid[blocks[x + z * W + y * WL]] === 63 ? 1 : 0;
+  const ao4 = [1, 1, 1, 1];
+  const cornerShade = (q, o, cull, x, y, z) => {
+    const d = DIRS[cull];
+    const bx = x + d[0], by = y + d[1], bz = z + d[2];
+    const [ta, tb] = cull < 2 ? [0, 2] : cull < 4 ? [0, 1] : [1, 2];
+    let any = false;
+    for (let k = 0; k < 4; k++) {
+      const pa = q[o + k * 3 + ta], pb = q[o + k * 3 + tb];
+      const sa = pa < 0.001 ? -1 : pa > 0.999 ? 1 : 0, sb = pb < 0.001 ? -1 : pb > 0.999 ? 1 : 0;
+      if (!sa || !sb) { ao4[k] = 1; continue; } // кут не в куті клітинки (плита, сходинка): без тіні
+      const ea = [0, 0, 0], eb = [0, 0, 0];
+      ea[ta] = sa; eb[tb] = sb;
+      const s1 = occ(bx + ea[0], by + ea[1], bz + ea[2]);
+      const s2 = occ(bx + eb[0], by + eb[1], bz + eb[2]);
+      const c = occ(bx + ea[0] + eb[0], by + ea[1] + eb[1], bz + ea[2] + eb[2]);
+      const level = s1 && s2 ? 0 : 3 - s1 - s2 - c;
+      ao4[k] = AO[level];
+      if (level < 3) any = true;
+    }
+    return any ? ao4 : null;
+  };
+
   for (let y = 0; y < H; y++) {
     for (let z = 0; z < L; z++) {
       for (let x = 0; x < W; x++) {
@@ -355,7 +385,8 @@ function buildTextured(schem, baked, atlas, { hideNatural, clippingPlanes }) {
               if (b.full && vis[nb] && B[nb].full && B[nb].group === b.group) continue; // стекло к стеклу, вода к воде
             }
           }
-          (q[o + 23] === 2 ? trans : opaque).quad(q, o, x, y, z, bright[id] ? GLOW : q[o + 22] * LIFT);
+          const ao = cull >= 0 && !bright[id] ? cornerShade(q, o, cull, x, y, z) : null;
+          (q[o + 23] === 2 ? trans : opaque).quad(q, o, x, y, z, bright[id] ? GLOW : q[o + 22] * LIFT, ao);
           faces++;
         }
         if (kind[id] === K.light && lit[id]) {
