@@ -89,10 +89,16 @@
       <div class="page">
         <div class="page-head">
           <h1>Схематики</h1>
-          <input type="search" id="schemSearch" placeholder="Пошук за назвою або автором">
+          <input type="search" id="schemSearch" class="resident-only" placeholder="Пошук за назвою або автором">
           <button class="btn primary editor-only" id="addSchemBtn2">+ Завантажити</button>
         </div>
-        <div class="schem-grid" id="schemList"></div>
+        <div class="locked guest-only">
+          <span class="lock-mark" aria-hidden="true"></span>
+          <h2>Лише для жителів міста</h2>
+          <p class="muted">Схематики бачать ті, хто увійшов. Логін і пароль видає адміністратор міста.</p>
+          <button class="btn primary" data-login>Увійти</button>
+        </div>
+        <div class="schem-grid resident-only" id="schemList"></div>
       </div>
     </section>
 
@@ -103,7 +109,13 @@
           <h1>Завдання</h1>
           <button class="btn primary editor-only" id="addTaskBtn">+ Завдання</button>
         </div>
-        <div class="board">
+        <div class="locked guest-only">
+          <span class="lock-mark" aria-hidden="true"></span>
+          <h2>Лише для жителів міста</h2>
+          <p class="muted">Завдання бачать ті, хто увійшов. Логін і пароль видає адміністратор міста.</p>
+          <button class="btn primary" data-login>Увійти</button>
+        </div>
+        <div class="board resident-only">
           <div class="column" data-status="todo"><h2>Треба зробити <span class="count"></span></h2><div class="cards"></div></div>
           <div class="column" data-status="doing"><h2>У роботі <span class="count"></span></h2><div class="cards"></div></div>
           <div class="column" data-status="done"><h2>Готово <span class="count"></span></h2><div class="cards"></div></div>
@@ -121,12 +133,52 @@
   <!-- Вікна -->
   <dialog id="loginDialog">
     <form method="dialog" class="form" id="loginForm">
-      <h2>Вхід для редакторів</h2>
-      <p class="muted">Пароль видає адміністратор міста. Без входу сайт можна лише переглядати й скачувати схематики.</p>
+      <h2>Вхід</h2>
+      <p class="muted">Для жителів міста: логін і пароль видає адміністратор. Без входу видно лише мапу.</p>
+      <label>Логін<input name="username" required maxlength="64" autocomplete="username" autocapitalize="off" spellcheck="false"></label>
       <label>Пароль<input type="password" name="password" required autocomplete="current-password"></label>
       <p class="error" data-error></p>
       <div class="actions"><button type="button" class="btn ghost" data-cancel>Скасувати</button><button class="btn primary">Увійти</button></div>
     </form>
+  </dialog>
+
+  <dialog id="accountDialog">
+    <div class="form">
+      <h2>Акаунт</h2>
+      <p data-who></p>
+      <form id="passwordForm" class="form sub-form">
+        <h3>Змінити пароль</h3>
+        <label>Старий пароль<input type="password" name="old" required autocomplete="current-password"></label>
+        <div class="row2">
+          <label>Новий<input type="password" name="password" required minlength="6" autocomplete="new-password"></label>
+          <label>Ще раз<input type="password" name="password2" required minlength="6" autocomplete="new-password"></label>
+        </div>
+        <p class="error" data-pass-error></p>
+        <div class="actions"><button class="btn">Змінити пароль</button></div>
+      </form>
+      <div class="actions">
+        <button type="button" class="btn admin-only" id="residentsBtn">Жителі</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn ghost" data-cancel>Закрити</button>
+        <button type="button" class="btn danger" id="logoutBtn">Вийти</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="residentsDialog" class="wide">
+    <div class="form">
+      <h2>Жителі <span class="count" id="residentsCount"></span></h2>
+      <p class="muted">Кожен житель отримує свій логін і пароль: з ними видно схематики й завдання. Редактор ще й може їх змінювати.</p>
+      <form id="residentForm" class="resident-add">
+        <label>Логін<input name="username" required maxlength="32" placeholder="Нік у грі" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+        <label>Пароль<input name="password" required minlength="6" autocomplete="off"></label>
+        <label>Роль<select name="role"><option value="resident">Житель</option><option value="editor">Редактор</option></select></label>
+        <button class="btn primary">Додати</button>
+        <p class="error" data-error></p>
+      </form>
+      <ul class="residents-list" id="residentsList"></ul>
+      <div class="actions"><button type="button" class="btn ghost" data-cancel>Закрити</button></div>
+    </div>
   </dialog>
 
   <dialog id="schemDialog">
