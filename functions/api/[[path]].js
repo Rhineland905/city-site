@@ -13,6 +13,19 @@ const json = (data, status = 200) =>
   });
 const fail = (status, error) => json({ error }, status);
 
+// D1 іноді на мить відмовляє («Network connection lost», «overloaded», «reset»): Cloudflare радить просто повторити.
+const D1_TRANSIENT = /network connection lost|overloaded|reset because|storage operation exceeded timeout|internal error|try again|temporarily/i;
+async function d1Retry(run) {
+  for (let i = 0; ; i++) {
+    try {
+      return await run();
+    } catch (e) {
+      if (i >= 2 || !D1_TRANSIENT.test(String(e?.message || e))) throw e;
+      await new Promise((r) => setTimeout(r, 300 * (i + 1)));
+    }
+  }
+}
+
 // Хто робить запит. Рахується один раз на запит у onRequest, далі читається звідси.
 // resident — житель міста з акаунтом (бачить схематики й завдання), editor — може змінювати,
 // admin — увійшов паролем редактора EDIT_PASSWORD під логіном admin і керує акаунтами жителів.
@@ -433,7 +446,10 @@ export async function onRequest({ request, env, params, waitUntil }) {
     return fail(404, 'Не знайдено');
   } catch (e) {
     console.error(e);
-    return fail(500, 'Помилка сервера');
+    // Тимчасовий збій бази — 503, щоб мод і сторінка знали, що варто повторити. Причину показуємо коротко:
+    // без неї з гри не зрозуміти, чому сайт не відповів.
+    const why = String(e?.message || e).replace(/\s+/g, ' ').slice(0, 160);
+    return fail(D1_TRANSIENT.test(why) ? 503 : 500, `Помилка сервера: ${why}`);
   }
 }
 
@@ -1100,11 +1116,11 @@ async function live(request, env, method, parts, waitUntil) {
     const now = Date.now();
     let saved = 0;
     if (ok.length) {
-      const res = await env.DB.batch(ok.map((t) => env.DB.prepare(
+      const res = await d1Retry(() => env.DB.batch(ok.map((t) => env.DB.prepare(
         `INSERT INTO live_blocks (layer, cx, cz, hash, data, updated_at) VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(layer, cx, cz) DO UPDATE SET hash = excluded.hash, data = excluded.data, updated_at = excluded.updated_at
          WHERE live_blocks.hash <> excluded.hash`
-      ).bind(id, t.cx, t.cz, t.hash, t.data, now)));
+      ).bind(id, t.cx, t.cz, t.hash, t.data, now))));
       saved = res.reduce((n, r) => n + (r.meta?.changes || 0), 0);
     }
     return json({ saved, unchanged: ok.length - saved, outside: count - ok.length });
@@ -1125,12 +1141,12 @@ async function live(request, env, method, parts, waitUntil) {
     const now = Date.now();
     let saved = 0;
     if (ok.length) {
-      const res = await env.DB.batch(ok.map((t) => env.DB.prepare(
+      const res = await d1Retry(() => env.DB.batch(ok.map((t) => env.DB.prepare(
         `INSERT INTO live_tiles (layer, cx, cz, hash, png, mini, player, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(layer, cx, cz) DO UPDATE SET hash = excluded.hash, png = excluded.png, mini = excluded.mini,
            player = excluded.player, updated_at = excluded.updated_at
          WHERE live_tiles.hash <> excluded.hash`
-      ).bind(id, t.cx, t.cz, t.hash, t.png, t.mini, player, now)));
+      ).bind(id, t.cx, t.cz, t.hash, t.png, t.mini, player, now))));
       saved = res.reduce((n, r) => n + (r.meta?.changes || 0), 0);
     }
     return json({ saved, unchanged: ok.length - saved, outside: tiles.length - ok.length });
