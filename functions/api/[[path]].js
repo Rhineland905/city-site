@@ -457,6 +457,10 @@ export async function onRequest({ request, env, params, waitUntil }) {
     if (section === 'pack') return await pack(request, env, method, id);
     if (section === 'lore') return await lore(request, env, method, id, action);
     if (section === 'members') return await members(request, env, method, id, action);
+    if (section === 'skin' && method === 'GET') { // прев’ю скіна за ніком у вікні профілю
+      const png = await mojangSkin(env, id);
+      return png ? imageResponse(png, 'image/png', `public, max-age=${SKIN_CACHE_S}`) : fail(404, 'Скіна немає');
+    }
     return fail(404, 'Не знайдено');
   } catch (e) {
     console.error(e);
@@ -1362,13 +1366,16 @@ async function members(request, env, method, id, action) {
   if (id !== undefined && memberId === null) return fail(404, 'Жителя не знайдено');
 
   if (action === 'skin' && (method === 'GET' || method === 'HEAD')) {
-    const row = await env.DB.prepare('SELECT nick, skin FROM members WHERE id = ?').bind(memberId).first();
+    const row = await env.DB.prepare(
+      'SELECT m.nick, m.skin, u.username AS account FROM members m LEFT JOIN users u ON u.id = m.user_id WHERE m.id = ?'
+    ).bind(memberId).first();
     if (!row) return fail(404, 'Жителя не знайдено');
     if (row.skin) {
       const value = await env.FILES.get(`skin:${memberId}:${row.skin}`, 'arrayBuffer');
       if (value) return imageResponse(value, 'image/png', 'public, max-age=31536000, immutable');
     }
-    const png = await mojangSkin(env, row.nick);
+    // Ніку не вказано — пробуємо логін на сайті: зазвичай це той самий нік, що й у грі.
+    const png = await mojangSkin(env, row.nick || row.account);
     if (!png) return fail(404, 'Скіна немає');
     return imageResponse(png, 'image/png', `public, max-age=${SKIN_CACHE_S}`);
   }
@@ -1470,34 +1477,56 @@ function pngSize(b) {
   return { w: dv.getUint32(16), h: dv.getUint32(20) };
 }
 
-// Скін ліцензійного гравця з Mojang за ніком. Кешується в KV на 6 годин, «немає скіна» — на годину.
+// Скін ліцензійного гравця за ніком. Спершу питаємо Mojang, а якщо Mojang не відповідає
+// (ліміт запитів, блок спільних IP Cloudflare), то playerdb.co, який віддає те саме з кешу Mojang.
+// Знайдений скін кешується в KV на 6 годин. «Такого ліцензійного ніка немає» — на годину,
+// а мережеву помилку не кешуємо, щоб наступний перегляд спробував знову.
+const MISS = Symbol('miss');
+async function getJson(url) {
+  const res = await fetch(url, { headers: { accept: 'application/json', 'user-agent': 'city-site' }, cf: { cacheTtl: 600 } });
+  if (res.status === 404 || res.status === 204) return MISS;
+  if (!res.ok) throw new Error(`${new URL(url).host} ${res.status}`);
+  return res.json();
+}
+async function skinUrlFromMojang(nick) {
+  let profile;
+  try { profile = await getJson(`https://api.minecraftservices.com/minecraft/profile/lookup/name/${nick}`); }
+  catch { profile = await getJson(`https://api.mojang.com/users/profiles/minecraft/${nick}`); }
+  if (profile === MISS || !profile?.id) return MISS;
+  const data = await getJson(`https://sessionserver.mojang.com/session/minecraft/profile/${profile.id}`);
+  const prop = data !== MISS && data?.properties?.find((p) => p.name === 'textures');
+  return (prop && JSON.parse(atob(prop.value))?.textures?.SKIN?.url) || MISS;
+}
+async function skinUrlFromPlayerDb(nick) {
+  const data = await getJson(`https://playerdb.co/api/player/minecraft/${nick}`);
+  if (data === MISS || data?.success === false) return MISS;
+  const p = data?.data?.player;
+  if (!p) throw new Error('playerdb: немає даних');
+  const prop = p.properties?.find((x) => x.name === 'textures');
+  const url = prop && JSON.parse(atob(prop.value))?.textures?.SKIN?.url;
+  return url || p.skin_texture || MISS;
+}
 async function mojangSkin(env, nick) {
   if (!nick || !NICK_RE.test(nick)) return null;
   const key = `skinc:${nick.toLowerCase()}`;
   const cached = await env.FILES.get(key, 'arrayBuffer');
   if (cached) return cached.byteLength ? cached : null;
+  let url = null, failed = 0;
+  for (const source of [skinUrlFromMojang, skinUrlFromPlayerDb]) {
+    try {
+      const found = await source(nick);
+      if (found === MISS) { url = MISS; break; } // джерело точно знає, що ліцензії з таким ніком немає
+      url = found;
+      break;
+    } catch (e) { failed++; console.error('skin', nick, String(e)); }
+  }
+  if (url === null && failed) return null; // усі джерела впали: не кешуємо
   let png = null;
-  try {
-    const get = (url) => fetch(url, { headers: { accept: 'application/json' }, cf: { cacheTtl: 3600 } });
-    let res = await get(`https://api.minecraftservices.com/minecraft/profile/lookup/name/${nick}`);
-    if (!res.ok) res = await get(`https://api.mojang.com/users/profiles/minecraft/${nick}`);
-    const profile = res.ok ? await res.json() : null;
-    if (profile?.id) {
-      const s = await get(`https://sessionserver.mojang.com/session/minecraft/profile/${profile.id}`);
-      const data = s.ok ? await s.json() : null;
-      const prop = data?.properties?.find((p) => p.name === 'textures');
-      const url = prop && JSON.parse(atob(prop.value))?.textures?.SKIN?.url;
-      if (url && /^https?:\/\/textures\.minecraft\.net\//.test(url)) {
-        const img = await fetch(url.replace(/^http:/, 'https:'));
-        if (img.ok) {
-          const buf = await img.arrayBuffer();
-          if (buf.byteLength <= SKIN_MAX && pngSize(new Uint8Array(buf))) png = buf;
-        }
-      }
-    }
-  } catch (e) {
-    console.error('mojang skin', e);
-    return null; // мережа впала: не кешуємо, спробуємо наступного разу
+  if (url !== MISS && /^https?:\/\/textures\.minecraft\.net\//.test(url)) {
+    const img = await fetch(url.replace(/^http:/, 'https:')).catch(() => null);
+    if (!img?.ok) return null;
+    const buf = await img.arrayBuffer();
+    if (buf.byteLength <= SKIN_MAX && pngSize(new Uint8Array(buf))) png = buf;
   }
   await env.FILES.put(key, png || new ArrayBuffer(0), { expirationTtl: png ? SKIN_CACHE_S : 3600 });
   return png;

@@ -2479,7 +2479,10 @@ async function loadTasks() {
 // якщо профіль прив’язаний до його акаунта. Скіни малює skin.js: плоскі на картках, 3D у профілі.
 const skinKit = () => import('./skin.js');
 const lore = { members: [], chapters: [], skins: new Map(), viewer: null, open: null };
-const memberSkinUrl = (m) => (m.skin || m.nick) ? `/api/members/${m.id}/skin?v=${encodeURIComponent(m.skin || m.nick)}` : null;
+const memberSkinUrl = (m) => {
+  const v = m.skin || m.nick || m.account; // без ніка сервер пробує логін на сайті
+  return v ? `/api/members/${m.id}/skin?v=${encodeURIComponent(v)}` : null;
+};
 const myMember = () => (state.me?.user && !state.me.admin ? lore.members.find((m) => m.user_id === state.me.user.id) : null);
 const canEditMember = (m) => isEditor() || (!!m && !!state.me?.user && !state.me.admin && m.user_id === state.me.user.id);
 
@@ -2492,6 +2495,14 @@ function memberSkin(m) {
       const kit = await skinKit();
       return kit.normalize(await kit.loadImage(url));
     })().catch(() => null));
+  }
+  return lore.skins.get(url);
+}
+
+function nickSkin(nick) {
+  const url = '/api/skin/' + encodeURIComponent(nick);
+  if (!lore.skins.has(url)) {
+    lore.skins.set(url, skinKit().then(async (kit) => kit.normalize(await kit.loadImage(url))).catch(() => null));
   }
   return lore.skins.get(url);
 }
@@ -2769,17 +2780,17 @@ async function renderSkinPick() {
   const { member, skin, drop } = memberEdit;
   $('[data-skin-drop]', f).hidden = !(skin || (member?.skin && !drop));
   const nick = f.nick.value.trim();
-  // Скін за ніком сервер шукає за збереженим ніком, тож новий нік покажеться після збереження.
+  // Без свого файлу показуємо скін ліцензії за тим ніком, що зараз у полі.
   let shown = skin;
-  if (!shown && member && !(drop && nick !== member.nick)) {
-    shown = await memberSkin(drop ? { ...member, skin: null } : member);
-  }
+  if (!shown && member?.skin && !drop) shown = await memberSkin(member);
+  if (!shown && /^[A-Za-z0-9_]{1,16}$/.test(nick)) shown = await nickSkin(nick);
   if (!f.closest('dialog').open) return;
   const kit = await skinKit();
   if (shown) box.replaceChildren(kit.drawFront(shown, 4));
   else box.innerHTML = '<span class="muted">Без скіна</span>';
   $('[data-skin-hint]', f).textContent = skin ? 'Новий скін збережеться разом із профілем.'
     : member?.skin && !drop ? 'Завантажено свій скін.'
+    : shown ? 'Скін ліцензії за ніком, оновлюється сам.'
     : 'Без файлу скін береться за ніком, якщо в гравця ліцензія.';
 }
 function openMemberEdit(m, prefill = {}) {
@@ -2818,6 +2829,10 @@ $('#memberForm [data-skin-drop]').addEventListener('click', () => {
   renderSkinPick();
 });
 $('#memberForm').nick.addEventListener('change', () => renderSkinPick());
+$('#memberForm').nick.addEventListener('input', () => {
+  clearTimeout(memberEdit.nickTimer);
+  memberEdit.nickTimer = setTimeout(renderSkinPick, 600);
+});
 $('#memberForm [data-skin-file]').addEventListener('change', async (e) => {
   const file = e.target.files[0];
   e.target.value = '';
