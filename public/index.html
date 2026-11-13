@@ -24,6 +24,7 @@
       <button class="tab active" data-view="map" role="tab">Мапа</button>
       <button class="tab" data-view="schematics" role="tab">Схематики</button>
       <button class="tab" data-view="tasks" role="tab">Завдання</button>
+      <button class="tab" data-view="lore" role="tab">Лор</button>
     </nav>
     <button class="btn ghost" id="loginBtn">Увійти</button>
   </header>
@@ -123,7 +124,36 @@
         </div>
       </div>
     </section>
+    <!-- Лор: історія міста й жителі -->
+    <section class="view" id="view-lore">
+      <div class="page">
+        <div class="page-head">
+          <h1>Лор міста</h1>
+          <span class="spacer"></span>
+          <button class="btn resident-only" id="myProfileBtn">Мій профіль</button>
+          <button class="btn editor-only" id="addMemberBtn">+ Житель</button>
+          <button class="btn primary editor-only" id="addLoreBtn">+ Розділ</button>
+        </div>
+        <section class="lore-block">
+          <div class="lore-head">
+            <h2>Жителі <span class="count" id="membersCount"></span></h2>
+            <input type="search" id="memberSearch" placeholder="Знайти жителя" aria-label="Знайти жителя">
+          </div>
+          <div class="member-grid" id="memberGrid"></div>
+        </section>
+        <section class="lore-block">
+          <div class="lore-head"><h2>Історія</h2></div>
+          <ol class="lore-list" id="loreList"></ol>
+        </section>
+      </div>
+    </section>
   </main>
+
+  <!-- Профіль жителя або розділ лору -->
+  <aside class="drawer lore-drawer" id="loreDrawer" hidden>
+    <button class="icon-btn close" data-close aria-label="Закрити">×</button>
+    <div id="loreDrawerBody"></div>
+  </aside>
 
   <!-- Панель схематика -->
   <aside class="drawer" id="schemDrawer" hidden>
@@ -375,6 +405,71 @@
       </div>
     </form>
   </dialog>
+
+  <dialog id="loreDialog" class="wide">
+    <form method="dialog" class="form" id="loreForm">
+      <h2 data-title>Розділ лору</h2>
+      <div class="row2">
+        <label>Назва<input name="title" required maxlength="120" placeholder="Наприклад, Як знайшли Давнє місто"></label>
+        <label>Час або епоха<input name="era" maxlength="60" placeholder="Сезон 1, весна"></label>
+      </div>
+      <label>Текст<textarea name="body" rows="14" maxlength="30000" placeholder="Порожній рядок починає новий абзац. ## Заголовок, **жирний**, *курсив*, @Нік — посилання на жителя."></textarea></label>
+      <div class="lore-cover-pick">
+        <div class="lore-cover-thumb" data-cover-thumb></div>
+        <div>
+          <button type="button" class="btn" data-cover-add>Обкладинка</button>
+          <button type="button" class="btn ghost" data-cover-drop hidden>Прибрати</button>
+          <input type="file" data-cover-file accept="image/png,image/jpeg,image/webp" hidden>
+          <p class="muted lore-note">Необов’язково. Скріншот можна вставити з буфера (Ctrl+V).</p>
+        </div>
+      </div>
+      <label>Порядок<input name="pos" type="number" step="1" placeholder="менше число — вище в історії"></label>
+      <p class="error" data-error></p>
+      <div class="actions">
+        <button type="button" class="btn danger" data-delete hidden>Видалити</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn ghost" data-cancel>Скасувати</button>
+        <button class="btn primary">Зберегти</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="memberDialog" class="wide">
+    <form method="dialog" class="form" id="memberForm">
+      <h2 data-title>Профіль жителя</h2>
+      <div class="member-edit">
+        <div class="skin-pick">
+          <div class="skin-preview" data-skin-preview><span class="muted">Без скіна</span></div>
+          <button type="button" class="btn" data-skin-add>Свій скін (PNG)</button>
+          <button type="button" class="btn ghost" data-skin-drop hidden>Прибрати свій</button>
+          <input type="file" data-skin-file accept="image/png" hidden>
+          <p class="muted lore-note" data-skin-hint>Без файлу скін береться за ніком, якщо в гравця ліцензія.</p>
+        </div>
+        <div class="member-fields">
+          <div class="row2">
+            <label>Ім’я в лорі<input name="name" required maxlength="60" placeholder="Як звуть персонажа"></label>
+            <label>Нік у грі<input name="nick" maxlength="32" autocapitalize="off" spellcheck="false" placeholder="Steve"></label>
+          </div>
+          <div class="row2">
+            <label>Роль у місті<input name="title" maxlength="80" placeholder="Мер, шахтар, архітектор"></label>
+            <label>У місті з<input name="since" maxlength="40" placeholder="Сезон 1"></label>
+          </div>
+          <label>Коротко<input name="bio" maxlength="300" placeholder="Одне речення, видно на картці"></label>
+          <label>Дім на мапі<select name="home_marker"><option value="">не вказано</option></select></label>
+          <label class="editor-only">Акаунт на сайті<input name="account" maxlength="64" list="accountNames" autocapitalize="off" spellcheck="false" placeholder="логін жителя, щоб він сам міг правити профіль"></label>
+        </div>
+      </div>
+      <label>Історія персонажа<textarea name="story" rows="10" maxlength="20000" placeholder="Звідки прийшов, чим займається, що знає про місто. Порожній рядок починає новий абзац."></textarea></label>
+      <p class="error" data-error></p>
+      <div class="actions">
+        <button type="button" class="btn danger" data-delete hidden>Видалити</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn ghost" data-cancel>Скасувати</button>
+        <button class="btn primary">Зберегти</button>
+      </div>
+    </form>
+  </dialog>
+  <datalist id="accountNames"></datalist>
 
   <!-- Картинки мітки на весь екран -->
   <dialog id="imgViewer" class="img-viewer" aria-label="Картинки мітки">
