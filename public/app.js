@@ -944,16 +944,22 @@ async function pollLive() {
       live.loaded = true;
       if (first || changed.length) renderAreas(); // ярлики областей показують, скільки чанків ще чекають
       if (!changed.length) return;
-      const res = await fetch(`/api/live/${encodeURIComponent(id)}/minis?since=${since}`, { cache: 'no-store' });
-      if (!res.ok) throw new Error('Помилка ' + res.status);
-      const buf = await res.arrayBuffer();
-      if (id !== live.layerId) return;
-      const dv = new DataView(buf);
+      // Міні сайт віддає сторінками (x-more: є ще), щоб кожен запит був легким для воркера.
       const got = [];
-      for (let o = 0; o + 1032 <= buf.byteLength; o += 1032) {
-        const cx = dv.getInt32(o), cz = dv.getInt32(o + 4);
-        live.minis.set(liveKey(cx, cz), new Uint8ClampedArray(buf, o + 8, 1024));
-        got.push([cx, cz]);
+      for (let offset = 0, more = true; more;) {
+        const res = await fetch(`/api/live/${encodeURIComponent(id)}/minis?since=${since}&offset=${offset}`, { cache: 'no-store' });
+        if (!res.ok) throw new Error('Помилка ' + res.status);
+        more = res.headers.get('x-more') === '1';
+        const buf = await res.arrayBuffer();
+        if (id !== live.layerId) return;
+        const dv = new DataView(buf);
+        for (let o = 0; o + 1032 <= buf.byteLength; o += 1032) {
+          const cx = dv.getInt32(o), cz = dv.getInt32(o + 4);
+          live.minis.set(liveKey(cx, cz), new Uint8ClampedArray(buf, o + 8, 1024));
+          got.push([cx, cz]);
+          offset++;
+        }
+        if (!buf.byteLength) break;
       }
       await drawLiveOverview(got);
       for (const [cx, cz] of changed) {
