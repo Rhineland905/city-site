@@ -67,6 +67,8 @@ function setSession(me) {
   renderPins(); // редактор може перетягувати мітки
   renderMarkersList();
   renderAreas();
+  renderMembers(); // кнопка «Мій профіль»
+  renderLore();
   return was !== state.me?.user?.id; // чи змінився житель
 }
 async function refreshMe() {
@@ -216,6 +218,7 @@ function showView(name) {
   $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.view === name));
   $$('.view').forEach((v) => v.classList.toggle('active', v.id === 'view-' + name));
   if (name === 'map') setTimeout(() => map.invalidateSize(), 0);
+  if (name !== 'lore' && !$('#loreDrawer').hidden) closeLoreDrawer();
 }
 $$('.tab').forEach((t) => t.addEventListener('click', () => showView(t.dataset.view)));
 
@@ -2471,6 +2474,415 @@ async function loadTasks() {
   renderTasks();
 }
 
+// ---------- Лор: історія міста й жителі ----------
+// Читати може кожен. Розділи історії пише редактор, профіль жителя — редактор або сам житель,
+// якщо профіль прив’язаний до його акаунта. Скіни малює skin.js: плоскі на картках, 3D у профілі.
+const skinKit = () => import('./skin.js');
+const lore = { members: [], chapters: [], skins: new Map(), viewer: null, open: null };
+const memberSkinUrl = (m) => (m.skin || m.nick) ? `/api/members/${m.id}/skin?v=${encodeURIComponent(m.skin || m.nick)}` : null;
+const myMember = () => (state.me?.user && !state.me.admin ? lore.members.find((m) => m.user_id === state.me.user.id) : null);
+const canEditMember = (m) => isEditor() || (!!m && !!state.me?.user && !state.me.admin && m.user_id === state.me.user.id);
+
+// Скін як полотно 64×64 (або null, якщо скіна немає). Кешується за адресою, яка міняється разом зі скіном.
+function memberSkin(m) {
+  const url = memberSkinUrl(m);
+  if (!url) return Promise.resolve(null);
+  if (!lore.skins.has(url)) {
+    lore.skins.set(url, (async () => {
+      const kit = await skinKit();
+      return kit.normalize(await kit.loadImage(url));
+    })().catch(() => null));
+  }
+  return lore.skins.get(url);
+}
+
+// Простий текст лору: порожній рядок — новий абзац, ## — заголовок, **жирний**, *курсив*, @Нік — житель.
+function loreInline(s) {
+  return esc(s)
+    .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+    .replace(/(^|[^*])\*([^*\n]+?)\*/g, '$1<i>$2</i>')
+    .replace(/(^|[\s(«"])@([\p{L}\p{N}_]{1,32})/gu, (all, pre, name) => {
+      const m = lore.members.find((x) => [x.nick, x.name].some((n) => n && n.toLowerCase() === name.toLowerCase()));
+      return m ? `${pre}<a class="mention" href="#p=${m.id}" data-member="${m.id}">${esc(m.name)}</a>` : all;
+    });
+}
+function prose(text) {
+  return String(text || '').replace(/\r/g, '').split(/\n\s*\n/).map((block) => {
+    const lines = block.trim().split('\n');
+    if (!lines[0]) return '';
+    let out = '';
+    if (/^#{2,3}\s+/.test(lines[0])) out += `<h3>${loreInline(lines.shift().replace(/^#+\s+/, ''))}</h3>`;
+    if (lines.length) out += `<p>${lines.map(loreInline).join('<br>')}</p>`;
+    return out;
+  }).join('');
+}
+const firstLines = (text, n = 220) => {
+  const t = String(text || '').replace(/^#+\s+.*$/gm, '').replace(/[*@]/g, '').replace(/\s+/g, ' ').trim();
+  return t.length > n ? t.slice(0, n).replace(/\s\S*$/, '') + '…' : t;
+};
+
+async function loadLore() {
+  const [members, chapters] = await Promise.all([api('members'), api('lore')]);
+  lore.members = members;
+  lore.chapters = chapters;
+  renderMembers();
+  renderLore();
+}
+
+function renderMembers() {
+  const q = $('#memberSearch').value.trim().toLowerCase();
+  const mine = myMember();
+  const list = lore.members.filter((m) => !q || [m.name, m.nick, m.title].some((s) => s && s.toLowerCase().includes(q)));
+  $('#membersCount').textContent = lore.members.length || '';
+  const btn = $('#myProfileBtn');
+  btn.hidden = !state.me?.user || state.me.admin;
+  btn.textContent = mine ? 'Мій профіль' : '+ Мій профіль';
+  const grid = $('#memberGrid');
+  if (!lore.members.length) {
+    grid.innerHTML = `<p class="empty">Тут з’являться жителі міста зі своїми скінами й історіями.${state.me?.user ? ' Почни зі свого профілю.' : ''}</p>`;
+    return;
+  }
+  if (!list.length) { grid.innerHTML = '<p class="empty">Нікого не знайдено</p>'; return; }
+  grid.innerHTML = list.map((m) => `
+    <button type="button" class="member-card${m === mine ? ' mine' : ''}" data-member="${m.id}">
+      <div class="fig" data-fig="${m.id}"><span class="fig-empty"></span></div>
+      <h3>${esc(m.name)}</h3>
+      ${m.title ? `<span class="role">${esc(m.title)}</span>` : ''}
+      ${m.bio ? `<p class="bio">${esc(m.bio)}</p>` : ''}
+    </button>`).join('');
+  for (const m of list) {
+    memberSkin(m).then(async (skin) => {
+      const fig = $(`[data-fig="${m.id}"]`, grid);
+      if (!skin || !fig) return;
+      const c = (await skinKit()).drawFront(skin, 4);
+      c.setAttribute('aria-hidden', 'true');
+      fig.replaceChildren(c);
+    });
+  }
+}
+$('#memberSearch').addEventListener('input', renderMembers);
+$('#memberGrid').addEventListener('click', (e) => {
+  const card = e.target.closest('[data-member]');
+  if (card) openMemberView(Number(card.dataset.member));
+});
+
+function renderLore() {
+  const list = $('#loreList');
+  if (!lore.chapters.length) {
+    list.innerHTML = `<li class="empty">Історію міста ще не записано.${isEditor() ? ' Натисни «+ Розділ», щоб почати.' : ''}</li>`;
+    list.classList.add('is-empty');
+    return;
+  }
+  list.classList.remove('is-empty');
+  list.innerHTML = lore.chapters.map((c) => `
+    <li class="lore-item">
+      <button type="button" class="lore-card" data-lore="${c.id}">
+        <div>
+          ${c.era ? `<span class="era">${esc(c.era)}</span>` : ''}
+          <h3>${esc(c.title)}</h3>
+          <p>${esc(firstLines(c.body))}</p>
+        </div>
+        ${c.cover ? `<img src="/api/lore/${c.id}/cover?v=${esc(c.cover)}" alt="" loading="lazy">` : ''}
+      </button>
+    </li>`).join('');
+}
+$('#loreList').addEventListener('click', (e) => {
+  const card = e.target.closest('[data-lore]');
+  if (card) openLoreView(Number(card.dataset.lore));
+});
+
+// --- Панель читання: профіль або розділ ---
+function closeLoreDrawer() {
+  lore.viewer?.dispose();
+  lore.viewer = null;
+  lore.open = null;
+  $('#loreDrawer').hidden = true;
+  if (/^#(p|l)=/.test(location.hash)) history.replaceState(null, '', location.pathname);
+}
+$('#loreDrawer [data-close]').addEventListener('click', closeLoreDrawer);
+addEventListener('keydown', (e) => { if (e.key === 'Escape' && !$('dialog[open]') && !$('#loreDrawer').hidden) closeLoreDrawer(); });
+$('#loreDrawerBody').addEventListener('click', (e) => {
+  const a = e.target.closest('a.mention');
+  if (a) { e.preventDefault(); openMemberView(Number(a.dataset.member)); }
+});
+
+function openMemberView(id) {
+  const m = lore.members.find((x) => x.id === id);
+  if (!m) return;
+  lore.viewer?.dispose();
+  lore.viewer = null;
+  lore.open = { kind: 'member', id };
+  history.replaceState(null, '', '#p=' + id);
+  const home = m.home_marker ? state.markers.find((x) => x.id === m.home_marker) : null;
+  const body = $('#loreDrawerBody');
+  body.innerHTML = `
+    <div class="profile-top">
+      <div class="skin3d" data-skin3d><div class="status">Завантажую скін…</div></div>
+      <div>
+        <h2>${esc(m.name)}</h2>
+        ${m.title ? `<div class="role">${esc(m.title)}</div>` : ''}
+        ${m.bio ? `<p class="bio">${esc(m.bio)}</p>` : ''}
+        <dl>
+          ${m.nick ? `<dt>Нік</dt><dd class="mono">${esc(m.nick)}</dd>` : ''}
+          ${m.since ? `<dt>У місті з</dt><dd>${esc(m.since)}</dd>` : ''}
+          ${home ? `<dt>Дім</dt><dd>${esc(home.name)}</dd>` : ''}
+        </dl>
+      </div>
+    </div>
+    <div class="prose">${m.story ? prose(m.story) : `<p class="muted">Історію ${esc(m.name)} ще не написано.</p>`}</div>
+    <div class="actions">
+      ${home ? '<button type="button" class="btn" data-act="home">Дім на мапі</button>' : ''}
+      ${m.nick ? '<button type="button" class="btn" data-act="nick">Скопіювати нік</button>' : ''}
+      ${canEditMember(m) ? '<button type="button" class="btn primary" data-act="edit">Редагувати</button>' : ''}
+    </div>`;
+  $('#loreDrawer').hidden = false;
+  $('#loreDrawer').scrollTop = 0;
+  const act = (name, fn) => { const b = $(`[data-act=${name}]`, body); if (b) b.onclick = fn; };
+  act('home', () => { closeLoreDrawer(); showView('map'); flyToMarker(home); });
+  act('nick', async () => {
+    try { await navigator.clipboard.writeText(m.nick); toast('Скопійовано: ' + m.nick); } catch { toast(m.nick); }
+  });
+  act('edit', () => openMemberEdit(m));
+
+  const box = $('[data-skin3d]', body);
+  memberSkin(m).then(async (skin) => {
+    if (!box.isConnected || lore.open?.id !== id) return;
+    if (!skin) {
+      $('.status', box).textContent = m.nick ? `Скіна для «${m.nick}» не знайшлося. Можна завантажити свій PNG у профілі.` : 'Скін ще не додано';
+      return;
+    }
+    const kit = await skinKit();
+    try {
+      const v = await kit.createSkinViewer(box, skin);
+      if (!box.isConnected || lore.open?.id !== id) { v.dispose(); return; }
+      lore.viewer = v;
+      $('.status', box)?.remove();
+    } catch {
+      // Без WebGL показуємо плоску фігуру.
+      const c = kit.drawFront(skin, 8);
+      box.replaceChildren(c);
+      c.style.cssText = 'width:auto;height:90%;margin:auto;image-rendering:pixelated;cursor:default';
+      box.style.display = 'grid';
+    }
+  });
+}
+
+function openLoreView(id) {
+  const c = lore.chapters.find((x) => x.id === id);
+  if (!c) return;
+  lore.viewer?.dispose();
+  lore.viewer = null;
+  lore.open = { kind: 'lore', id };
+  history.replaceState(null, '', '#l=' + id);
+  const cover = c.cover ? `/api/lore/${c.id}/cover?v=${encodeURIComponent(c.cover)}` : null;
+  const body = $('#loreDrawerBody');
+  body.innerHTML = `
+    ${c.era ? `<span class="era">${esc(c.era)}</span>` : ''}
+    <h2>${esc(c.title)}</h2>
+    ${cover ? `<img class="cover" src="${esc(cover)}" alt="" data-act="cover">` : ''}
+    <div class="prose">${prose(c.body) || '<p class="muted">Розділ поки порожній.</p>'}</div>
+    <p class="muted small-note">${c.author ? esc(c.author) + ' · ' : ''}${fmtDate(c.updated_at)}</p>
+    <div class="actions">${isEditor() ? '<button type="button" class="btn primary" data-act="edit">Редагувати</button>' : ''}</div>`;
+  $('#loreDrawer').hidden = false;
+  $('#loreDrawer').scrollTop = 0;
+  const coverEl = $('[data-act=cover]', body);
+  if (coverEl) coverEl.onclick = () => openViewer([{ full: cover, thumb: cover }], 0, c.title);
+  const edit = $('[data-act=edit]', body);
+  if (edit) edit.onclick = () => openLoreEdit(c);
+}
+
+// --- Розділ лору: створення й редагування (редактор) ---
+const loreEdit = { chapter: null, file: null, url: null, drop: false };
+function renderCoverPick() {
+  const f = $('#loreForm');
+  const { chapter, url, drop } = loreEdit;
+  const src = url || (!drop && chapter?.cover ? `/api/lore/${chapter.id}/cover?v=${encodeURIComponent(chapter.cover)}` : null);
+  $('[data-cover-thumb]', f).innerHTML = src ? `<img src="${esc(src)}" alt="">` : '';
+  $('[data-cover-drop]', f).hidden = !src;
+}
+function setCover(file) {
+  if (loreEdit.url) URL.revokeObjectURL(loreEdit.url);
+  loreEdit.file = file;
+  loreEdit.url = file ? URL.createObjectURL(file) : null;
+  renderCoverPick();
+}
+function openLoreEdit(c) {
+  const f = $('#loreForm');
+  f.reset();
+  loreEdit.chapter = c || null;
+  loreEdit.drop = false;
+  setCover(null);
+  $('[data-title]', f).textContent = c ? 'Розділ лору' : 'Новий розділ';
+  if (c) { f.title.value = c.title; f.era.value = c.era || ''; f.body.value = c.body || ''; f.pos.value = c.pos; }
+  $('[data-delete]', f).hidden = !c;
+  openDialog('#loreDialog');
+}
+$('#addLoreBtn').addEventListener('click', () => openLoreEdit(null));
+$('#loreForm [data-cover-add]').addEventListener('click', () => $('#loreForm [data-cover-file]').click());
+$('#loreForm [data-cover-file]').addEventListener('change', (e) => { if (e.target.files[0]) setCover(e.target.files[0]); e.target.value = ''; });
+$('#loreForm [data-cover-drop]').addEventListener('click', () => { loreEdit.drop = true; setCover(null); });
+$('#loreDialog').addEventListener('paste', (e) => {
+  const file = [...(e.clipboardData?.files || [])].find((x) => x.type.startsWith('image/'));
+  if (file) { e.preventDefault(); setCover(file); }
+});
+$('#loreDialog').addEventListener('close', () => setCover(null));
+$('#loreForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const f = e.target;
+  withBusy(f, async () => {
+    const body = { title: f.title.value, era: f.era.value, body: f.body.value };
+    if (f.pos.value !== '') body.pos = Number(f.pos.value);
+    const c = loreEdit.chapter
+      ? await api('lore/' + loreEdit.chapter.id, { method: 'PATCH', json: body })
+      : await api('lore', { method: 'POST', json: body });
+    if (loreEdit.file) {
+      const pic = await preparePic(loreEdit.file);
+      const form = new FormData();
+      form.append('image', pic.blob, 'cover');
+      await api(`lore/${c.id}/cover`, { method: 'PUT', body: form });
+    } else if (loreEdit.drop && loreEdit.chapter?.cover) {
+      await api(`lore/${c.id}/cover`, { method: 'DELETE' });
+    }
+    f.closest('dialog').close();
+    await loadLore();
+    openLoreView(c.id);
+    toast('Розділ збережено');
+  });
+});
+$('#loreForm [data-delete]').addEventListener('click', async () => {
+  const f = $('#loreForm');
+  const c = loreEdit.chapter;
+  if (!c || !confirm(`Видалити розділ «${c.title}»?`)) return;
+  try {
+    await api('lore/' + c.id, { method: 'DELETE' });
+    f.closest('dialog').close();
+    closeLoreDrawer();
+    await loadLore();
+  } catch (err) { showError(f, err.message); }
+});
+
+// --- Профіль жителя: створення й редагування ---
+const memberEdit = { member: null, file: null, skin: null, drop: false };
+async function renderSkinPick() {
+  const f = $('#memberForm');
+  const box = $('[data-skin-preview]', f);
+  const { member, skin, drop } = memberEdit;
+  $('[data-skin-drop]', f).hidden = !(skin || (member?.skin && !drop));
+  const nick = f.nick.value.trim();
+  // Скін за ніком сервер шукає за збереженим ніком, тож новий нік покажеться після збереження.
+  let shown = skin;
+  if (!shown && member && !(drop && nick !== member.nick)) {
+    shown = await memberSkin(drop ? { ...member, skin: null } : member);
+  }
+  if (!f.closest('dialog').open) return;
+  const kit = await skinKit();
+  if (shown) box.replaceChildren(kit.drawFront(shown, 4));
+  else box.innerHTML = '<span class="muted">Без скіна</span>';
+  $('[data-skin-hint]', f).textContent = skin ? 'Новий скін збережеться разом із профілем.'
+    : member?.skin && !drop ? 'Завантажено свій скін.'
+    : 'Без файлу скін береться за ніком, якщо в гравця ліцензія.';
+}
+function openMemberEdit(m, prefill = {}) {
+  const f = $('#memberForm');
+  f.reset();
+  memberEdit.member = m || null;
+  memberEdit.file = null; memberEdit.skin = null; memberEdit.drop = false;
+  $('[data-title]', f).textContent = m ? 'Профіль жителя' : 'Новий житель';
+  const sel = f.home_marker;
+  sel.innerHTML = '<option value="">не вказано</option>' + [...state.markers]
+    .sort((a, b) => a.name.localeCompare(b.name, 'uk'))
+    .map((x) => `<option value="${x.id}">${esc(x.name)}</option>`).join('');
+  const v = { ...(m || {}), ...prefill };
+  f.name.value = v.name || ''; f.nick.value = v.nick || ''; f.title.value = v.title || '';
+  f.since.value = v.since || ''; f.bio.value = v.bio || ''; f.story.value = v.story || '';
+  f.account.value = v.account || '';
+  sel.value = v.home_marker ? String(v.home_marker) : '';
+  $('[data-delete]', f).hidden = !m;
+  openDialog('#memberDialog');
+  renderSkinPick();
+  if (state.me?.admin) {
+    api('users').then((users) => {
+      $('#accountNames').innerHTML = users.map((u) => `<option value="${esc(u.username)}">`).join('');
+    }).catch(() => {});
+  }
+}
+$('#addMemberBtn').addEventListener('click', () => openMemberEdit(null));
+$('#myProfileBtn').addEventListener('click', () => {
+  const mine = myMember();
+  if (mine) openMemberView(mine.id);
+  else openMemberEdit(null, { name: state.me.user.username, nick: state.me.user.username });
+});
+$('#memberForm [data-skin-add]').addEventListener('click', () => $('#memberForm [data-skin-file]').click());
+$('#memberForm [data-skin-drop]').addEventListener('click', () => {
+  memberEdit.file = null; memberEdit.skin = null; memberEdit.drop = true;
+  renderSkinPick();
+});
+$('#memberForm').nick.addEventListener('change', () => renderSkinPick());
+$('#memberForm [data-skin-file]').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  const f = $('#memberForm');
+  showError(f, '');
+  try {
+    if (file.size > 64 * 1024) throw new Error('Файл скіна завеликий');
+    const kit = await skinKit();
+    const url = URL.createObjectURL(file);
+    const img = await kit.loadImage(url).finally(() => URL.revokeObjectURL(url));
+    if (img.width !== 64 || (img.height !== 64 && img.height !== 32)) throw new Error('Скін має бути PNG 64×64 (або старий 64×32)');
+    memberEdit.file = file;
+    memberEdit.skin = kit.normalize(img);
+    memberEdit.drop = false;
+    renderSkinPick();
+  } catch (err) { showError(f, err.message); }
+});
+$('#memberForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const f = e.target;
+  withBusy(f, async () => {
+    const body = {
+      name: f.name.value, nick: f.nick.value, title: f.title.value, since: f.since.value,
+      bio: f.bio.value, story: f.story.value, home_marker: f.home_marker.value || null,
+    };
+    if (isEditor()) body.account = f.account.value;
+    const cur = memberEdit.member;
+    let m = cur
+      ? await api('members/' + cur.id, { method: 'PATCH', json: body })
+      : await api('members', { method: 'POST', json: body });
+    if (memberEdit.file) {
+      m = await api(`members/${m.id}/skin`, { method: 'PUT', body: memberEdit.file, headers: { 'content-type': 'image/png' } });
+    } else if (memberEdit.drop && cur?.skin) {
+      m = await api(`members/${m.id}/skin`, { method: 'DELETE' });
+    }
+    f.closest('dialog').close();
+    await loadLore();
+    openMemberView(m.id);
+    toast('Профіль збережено');
+  });
+});
+$('#memberForm [data-delete]').addEventListener('click', async () => {
+  const f = $('#memberForm');
+  const m = memberEdit.member;
+  if (!m || !confirm(`Видалити профіль «${m.name}»?`)) return;
+  try {
+    await api('members/' + m.id, { method: 'DELETE' });
+    f.closest('dialog').close();
+    closeLoreDrawer();
+    await loadLore();
+  } catch (err) { showError(f, err.message); }
+});
+
+// Посилання #p=<житель> і #l=<розділ> відкривають вкладку «Лор» одразу на потрібному.
+function openLoreHash() {
+  const m = location.hash.match(/^#(p|l)=(\d+)$/);
+  if (!m) return false;
+  showView('lore');
+  if (m[1] === 'p') openMemberView(Number(m[2]));
+  else openLoreView(Number(m[2]));
+  return true;
+}
+addEventListener('hashchange', openLoreHash);
+
 // ---------- Старт ----------
 (async () => {
   setSession(await api('auth').catch(() => null));
@@ -2483,6 +2895,7 @@ async function loadTasks() {
     }
   }
   try {
+    const loreReady = loadLore().then(() => true, (err) => toast('Не вдалося завантажити лор: ' + err.message));
     await Promise.all([loadLayers(), loadSchematics(), loadTasks(), loadMarkers()]);
     renderCityMap();
     fitCity();
@@ -2491,6 +2904,7 @@ async function loadTasks() {
     const m = location.hash.match(/^#s=(.+)$/);
     if (m && isResident()) openSchematic(m[1]);
     else if (m) openDialog('#loginDialog');
+    if (await loreReady) openLoreHash();
   } catch (err) {
     toast('Не вдалося завантажити дані: ' + err.message);
   }

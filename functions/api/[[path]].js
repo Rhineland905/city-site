@@ -245,6 +245,7 @@ async function users(request, env, method, id) {
   if (method === 'DELETE') {
     await env.DB.batch([
       env.DB.prepare('DELETE FROM sessions WHERE user_id = ?').bind(userId),
+      env.DB.prepare('UPDATE members SET user_id = NULL WHERE user_id = ?').bind(userId), // профіль у лорі лишається
       env.DB.prepare('DELETE FROM users WHERE id = ?').bind(userId),
     ]);
     return json({ ok: true });
@@ -317,6 +318,17 @@ const SCHEMA = [
   'CREATE INDEX IF NOT EXISTS live_tiles_updated ON live_tiles (layer, updated_at)',
   BLOCKS_SCHEMA,
   'CREATE INDEX IF NOT EXISTS live_blocks_updated ON live_blocks (layer, updated_at)',
+  `CREATE TABLE IF NOT EXISTS lore (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, era TEXT DEFAULT '', body TEXT DEFAULT '',
+    pos INTEGER NOT NULL DEFAULT 0, cover TEXT, author TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE TABLE IF NOT EXISTS members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, nick TEXT DEFAULT '', title TEXT DEFAULT '',
+    bio TEXT DEFAULT '', story TEXT DEFAULT '', since TEXT DEFAULT '',
+    user_id INTEGER UNIQUE, home_marker INTEGER, skin TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
 ];
 // Типи міток. Підписи й значки задає сайт (app.js), тут лише список дозволених.
 const MARKER_KINDS = ['home', 'farm', 'storage', 'mine', 'portal', 'shop', 'danger', 'other'];
@@ -443,6 +455,8 @@ export async function onRequest({ request, env, params, waitUntil }) {
     if (section === 'live') return await live(request, env, method, parts, waitUntil);
     if (section === 'colors' && method === 'GET') return json(await getColors(env));
     if (section === 'pack') return await pack(request, env, method, id);
+    if (section === 'lore') return await lore(request, env, method, id, action);
+    if (section === 'members') return await members(request, env, method, id, action);
     return fail(404, 'Не знайдено');
   } catch (e) {
     console.error(e);
@@ -1226,4 +1240,265 @@ async function live(request, env, method, parts, waitUntil) {
     return json({ ok: true });
   }
   return fail(405, 'Метод не підтримується');
+}
+
+// ---------- Лор міста ----------
+// Розділи історії міста. Читати може кожен, писати — редактор. До розділу можна додати одну обкладинку:
+// сайт сам стискає її перед завантаженням, у KV вона лежить під lore:<розділ>:<id обкладинки>.
+async function lore(request, env, method, id, action) {
+  if (!id && method === 'GET') {
+    const { results } = await env.DB.prepare('SELECT * FROM lore ORDER BY pos, id').all();
+    return json(results);
+  }
+  const loreId = id === undefined ? null : int(id);
+  if (id !== undefined && loreId === null) return fail(404, 'Розділ не знайдено');
+
+  if (action === 'cover' && (method === 'GET' || method === 'HEAD')) {
+    const row = await env.DB.prepare('SELECT cover FROM lore WHERE id = ?').bind(loreId).first();
+    if (!row?.cover) return fail(404, 'Обкладинки немає');
+    const { value, metadata } = await env.FILES.getWithMetadata(`lore:${loreId}:${row.cover}`, 'arrayBuffer');
+    if (!value) return fail(404, 'Обкладинки немає');
+    return imageResponse(value, metadata?.type, 'public, max-age=31536000, immutable'); // адреса має ?v=<id обкладинки>
+  }
+  if (!authorized(request)) return fail(401, 'Потрібні права редактора');
+
+  const read = async (cur = {}) => {
+    const body = await request.json().catch(() => null);
+    if (!body) return 'Не вдалося прочитати розділ';
+    const has = (k) => body[k] !== undefined;
+    const r = {
+      title: has('title') ? str(body.title, 120) : cur.title,
+      era: has('era') ? str(body.era, 60) : cur.era ?? '',
+      body: has('body') ? String(body.body ?? '').slice(0, 30000) : cur.body ?? '',
+      pos: has('pos') ? int(body.pos) ?? 0 : cur.pos ?? 0,
+    };
+    if (!r.title) return 'Вкажи назву розділу';
+    return r;
+  };
+
+  if (!id && method === 'POST') {
+    const r = await read();
+    if (typeof r === 'string') return fail(400, r);
+    if (r.pos === 0) {
+      const last = await env.DB.prepare('SELECT MAX(pos) AS p FROM lore').first();
+      r.pos = (last?.p || 0) + 10;
+    }
+    const row = await env.DB.prepare(
+      'INSERT INTO lore (title, era, body, pos, author) VALUES (?, ?, ?, ?, ?) RETURNING *'
+    ).bind(r.title, r.era, r.body, r.pos, who(request).user?.username || '').first();
+    return json(row, 201);
+  }
+  if (loreId === null) return fail(405, 'Метод не підтримується');
+  const cur = await env.DB.prepare('SELECT * FROM lore WHERE id = ?').bind(loreId).first();
+  if (!cur) return fail(404, 'Розділ не знайдено');
+
+  if (action === 'cover') {
+    if (method === 'PUT') {
+      const form = await request.formData().catch(() => null);
+      const file = form?.get('image');
+      if (!file || typeof file === 'string' || !file.size) return fail(400, 'Не вибрано картинку');
+      if (!IMAGE_TYPES.includes(file.type)) return fail(400, 'Потрібна картинка PNG, JPG або WebP');
+      if (file.size > MARKER_IMAGE_MAX) return fail(400, 'Картинка більша за 3 МБ');
+      const coverId = randomHex(6);
+      await env.FILES.put(`lore:${loreId}:${coverId}`, await file.arrayBuffer(), { metadata: { type: file.type } });
+      const row = await env.DB.prepare("UPDATE lore SET cover = ?, updated_at = datetime('now') WHERE id = ? RETURNING *")
+        .bind(coverId, loreId).first();
+      if (cur.cover) await env.FILES.delete(`lore:${loreId}:${cur.cover}`);
+      return json(row);
+    }
+    if (method === 'DELETE') {
+      if (cur.cover) await env.FILES.delete(`lore:${loreId}:${cur.cover}`);
+      const row = await env.DB.prepare("UPDATE lore SET cover = NULL, updated_at = datetime('now') WHERE id = ? RETURNING *")
+        .bind(loreId).first();
+      return json(row);
+    }
+    return fail(405, 'Метод не підтримується');
+  }
+  if (method === 'PATCH') {
+    const r = await read(cur);
+    if (typeof r === 'string') return fail(400, r);
+    const row = await env.DB.prepare(
+      "UPDATE lore SET title = ?, era = ?, body = ?, pos = ?, updated_at = datetime('now') WHERE id = ? RETURNING *"
+    ).bind(r.title, r.era, r.body, r.pos, loreId).first();
+    return json(row);
+  }
+  if (method === 'DELETE') {
+    await env.DB.prepare('DELETE FROM lore WHERE id = ?').bind(loreId).run();
+    if (cur.cover) await env.FILES.delete(`lore:${loreId}:${cur.cover}`);
+    return json({ ok: true });
+  }
+  return fail(405, 'Метод не підтримується');
+}
+
+function imageResponse(value, type, cache) {
+  return new Response(value, {
+    headers: { 'content-type': type || 'image/webp', 'x-content-type-options': 'nosniff', 'cache-control': cache },
+  });
+}
+
+// ---------- Жителі: профілі з лором і скіном ----------
+// Профіль може бути прив’язаний до акаунта жителя (user_id): тоді житель сам його редагує.
+// Редактор створює й правит будь-які профілі. Скін — або свій PNG 64×64 (64×32 для старих скінів),
+// або береться в Mojang за ніком, якщо гравець має ліцензію. Свій PNG лежить у KV під skin:<профіль>:<id>.
+const SKIN_MAX = 64 * 1024;
+const NICK_RE = /^[A-Za-z0-9_]{1,16}$/;
+const SKIN_CACHE_S = 6 * 3600;
+
+async function memberRows(env, where = '', ...args) {
+  const { results } = await env.DB.prepare(
+    `SELECT m.*, u.username AS account FROM members m LEFT JOIN users u ON u.id = m.user_id ${where}
+     ORDER BY m.name COLLATE NOCASE`
+  ).bind(...args).all();
+  return results;
+}
+function canEditMember(request, row) {
+  const w = who(request);
+  return w.editor || (!!w.user && !w.admin && row.user_id === w.user.id);
+}
+
+async function members(request, env, method, id, action) {
+  if (!id && method === 'GET') return json(await memberRows(env));
+  const memberId = id === undefined ? null : int(id);
+  if (id !== undefined && memberId === null) return fail(404, 'Жителя не знайдено');
+
+  if (action === 'skin' && (method === 'GET' || method === 'HEAD')) {
+    const row = await env.DB.prepare('SELECT nick, skin FROM members WHERE id = ?').bind(memberId).first();
+    if (!row) return fail(404, 'Жителя не знайдено');
+    if (row.skin) {
+      const value = await env.FILES.get(`skin:${memberId}:${row.skin}`, 'arrayBuffer');
+      if (value) return imageResponse(value, 'image/png', 'public, max-age=31536000, immutable');
+    }
+    const png = await mojangSkin(env, row.nick);
+    if (!png) return fail(404, 'Скіна немає');
+    return imageResponse(png, 'image/png', `public, max-age=${SKIN_CACHE_S}`);
+  }
+
+  const w = who(request);
+  if (!w.user) return fail(401, 'Увійди, щоб редагувати профілі');
+
+  const read = async (cur = {}) => {
+    const body = await request.json().catch(() => null);
+    if (!body) return 'Не вдалося прочитати профіль';
+    const has = (k) => body[k] !== undefined;
+    const m = {
+      name: has('name') ? str(body.name, 60) : cur.name,
+      nick: has('nick') ? str(body.nick, 32) : cur.nick ?? '',
+      title: has('title') ? str(body.title, 80) : cur.title ?? '',
+      bio: has('bio') ? str(body.bio, 300) : cur.bio ?? '',
+      story: has('story') ? String(body.story ?? '').slice(0, 20000) : cur.story ?? '',
+      since: has('since') ? str(body.since, 40) : cur.since ?? '',
+      home_marker: has('home_marker') ? (body.home_marker === null || body.home_marker === '' ? null : int(body.home_marker)) : cur.home_marker ?? null,
+      user_id: cur.user_id ?? null,
+    };
+    if (!m.name) return 'Вкажи ім’я';
+    // До якого акаунта прив’язати профіль, вирішує лише редактор.
+    if (has('account') && w.editor) {
+      const account = str(body.account, 64);
+      if (!account) m.user_id = null;
+      else {
+        const u = await env.DB.prepare('SELECT id FROM users WHERE username = ? COLLATE NOCASE').bind(account).first();
+        if (!u) return `Акаунта «${account}» немає`;
+        m.user_id = u.id;
+      }
+    }
+    if (m.user_id !== null && (m.user_id !== cur.user_id || !cur.id)) {
+      const taken = await env.DB.prepare('SELECT id FROM members WHERE user_id = ?').bind(m.user_id).first();
+      if (taken) return 'У цього акаунта вже є профіль';
+    }
+    return m;
+  };
+  const one = async (mid) => (await memberRows(env, 'WHERE m.id = ?', mid))[0];
+
+  if (!id && method === 'POST') {
+    // Житель може створити лише свій профіль, редактор — будь-який.
+    const m = await read(w.editor ? {} : { user_id: w.admin ? null : w.user.id });
+    if (typeof m === 'string') return fail(400, m);
+    if (!w.editor && m.user_id === null) return fail(401, 'Потрібні права редактора');
+    const row = await env.DB.prepare(
+      `INSERT INTO members (name, nick, title, bio, story, since, user_id, home_marker)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`
+    ).bind(m.name, m.nick, m.title, m.bio, m.story, m.since, m.user_id, m.home_marker).first();
+    return json(await one(row.id), 201);
+  }
+  if (memberId === null) return fail(405, 'Метод не підтримується');
+  const cur = await env.DB.prepare('SELECT * FROM members WHERE id = ?').bind(memberId).first();
+  if (!cur) return fail(404, 'Жителя не знайдено');
+  if (!canEditMember(request, cur)) return fail(401, 'Це не твій профіль');
+
+  if (action === 'skin') {
+    if (method === 'PUT') {
+      const buf = await request.arrayBuffer();
+      if (buf.byteLength > SKIN_MAX) return fail(400, 'Файл скіна завеликий');
+      const size = pngSize(new Uint8Array(buf));
+      if (!size) return fail(400, 'Скін має бути PNG');
+      if (size.w !== 64 || (size.h !== 64 && size.h !== 32)) return fail(400, 'Скін має бути 64×64 (або старий 64×32)');
+      const skinId = randomHex(6);
+      await env.FILES.put(`skin:${memberId}:${skinId}`, buf);
+      await env.DB.prepare("UPDATE members SET skin = ?, updated_at = datetime('now') WHERE id = ?").bind(skinId, memberId).run();
+      if (cur.skin) await env.FILES.delete(`skin:${memberId}:${cur.skin}`);
+      return json(await one(memberId));
+    }
+    if (method === 'DELETE') {
+      if (cur.skin) await env.FILES.delete(`skin:${memberId}:${cur.skin}`);
+      await env.DB.prepare("UPDATE members SET skin = NULL, updated_at = datetime('now') WHERE id = ?").bind(memberId).run();
+      return json(await one(memberId));
+    }
+    return fail(405, 'Метод не підтримується');
+  }
+  if (method === 'PATCH') {
+    const m = await read(cur);
+    if (typeof m === 'string') return fail(400, m);
+    await env.DB.prepare(
+      `UPDATE members SET name = ?, nick = ?, title = ?, bio = ?, story = ?, since = ?, user_id = ?, home_marker = ?,
+       updated_at = datetime('now') WHERE id = ?`
+    ).bind(m.name, m.nick, m.title, m.bio, m.story, m.since, m.user_id, m.home_marker, memberId).run();
+    return json(await one(memberId));
+  }
+  if (method === 'DELETE') {
+    await env.DB.prepare('DELETE FROM members WHERE id = ?').bind(memberId).run();
+    if (cur.skin) await env.FILES.delete(`skin:${memberId}:${cur.skin}`);
+    return json({ ok: true });
+  }
+  return fail(405, 'Метод не підтримується');
+}
+
+// Розмір картинки з заголовка PNG (IHDR), без розпаковки.
+function pngSize(b) {
+  const sig = [137, 80, 78, 71, 13, 10, 26, 10];
+  if (b.length < 24 || sig.some((v, i) => b[i] !== v)) return null;
+  const dv = new DataView(b.buffer, b.byteOffset);
+  return { w: dv.getUint32(16), h: dv.getUint32(20) };
+}
+
+// Скін ліцензійного гравця з Mojang за ніком. Кешується в KV на 6 годин, «немає скіна» — на годину.
+async function mojangSkin(env, nick) {
+  if (!nick || !NICK_RE.test(nick)) return null;
+  const key = `skinc:${nick.toLowerCase()}`;
+  const cached = await env.FILES.get(key, 'arrayBuffer');
+  if (cached) return cached.byteLength ? cached : null;
+  let png = null;
+  try {
+    const get = (url) => fetch(url, { headers: { accept: 'application/json' }, cf: { cacheTtl: 3600 } });
+    let res = await get(`https://api.minecraftservices.com/minecraft/profile/lookup/name/${nick}`);
+    if (!res.ok) res = await get(`https://api.mojang.com/users/profiles/minecraft/${nick}`);
+    const profile = res.ok ? await res.json() : null;
+    if (profile?.id) {
+      const s = await get(`https://sessionserver.mojang.com/session/minecraft/profile/${profile.id}`);
+      const data = s.ok ? await s.json() : null;
+      const prop = data?.properties?.find((p) => p.name === 'textures');
+      const url = prop && JSON.parse(atob(prop.value))?.textures?.SKIN?.url;
+      if (url && /^https?:\/\/textures\.minecraft\.net\//.test(url)) {
+        const img = await fetch(url.replace(/^http:/, 'https:'));
+        if (img.ok) {
+          const buf = await img.arrayBuffer();
+          if (buf.byteLength <= SKIN_MAX && pngSize(new Uint8Array(buf))) png = buf;
+        }
+      }
+    }
+  } catch (e) {
+    console.error('mojang skin', e);
+    return null; // мережа впала: не кешуємо, спробуємо наступного разу
+  }
+  await env.FILES.put(key, png || new ArrayBuffer(0), { expirationTtl: png ? SKIN_CACHE_S : 3600 });
+  return png;
 }
