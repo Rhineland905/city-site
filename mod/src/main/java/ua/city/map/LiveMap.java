@@ -34,13 +34,19 @@ import java.util.function.Consumer;
  * стиснення в PNG і мережа — в окремому потоці, щоб гра не підвисала.
  */
 final class LiveMap {
-    private static final long TICK_BUDGET_NS = 2_000_000L; // не більше ~2 мс на такт гри (такт триває 50 мс)
+    // У середньому не більше ~1 мс на такт гри (такт — 50 мс). Один чанк малюється довше, тож
+    // перевищення записуємо в борг і наступні такти пропускаємо, поки не відпрацюємо.
+    private static final long TICK_BUDGET_NS = 1_000_000L;
+    private static final long MAX_DEBT_NS = 50_000_000L;
     private static final long NEIGHBOUR_WAIT_MS = 10_000;  // чекаємо сусідів, щоб краї чанка вийшли правильними
     private static final long NEAR_SCAN_MS = 20_000;       // поруч із гравцем перемальовуємо часто: там будують
     private static final long FULL_SCAN_MS = 180_000;
     private static final long REFRESH_MS = 60_000;          // шари, області й що вже лежить на сайті
     private static final int BATCH = 24;                   // стільки чанків приймає сайт за раз
-    private static final int BATCH_BYTES = 5 * 1024 * 1024;
+    // Скільки байтів за запит. Сайт на безкоштовному плані Cloudflare має ~10 мс процесора на запит,
+    // і великий пакет він не встигає записати (Cloudflare тоді віддає голий 503). 503 — ділимо пакет навпіл.
+    private static final int BATCH_BYTES = 256 * 1024;
+    private static final int MIN_BATCH_BYTES = 24 * 1024;
     private static final int MAX_PENDING = 400;
     private static final long OFFLINE_NOTICE_MS = 120_000; // казати гравцю, лише якщо сайт мовчить довше за 2 хвилини
     private static final byte[] EMPTY_BODY = {'C', 'M', 'T', '1', 0, 0};
@@ -64,6 +70,7 @@ final class LiveMap {
     private long nextNear, nextFull, nextRefresh, nextFlush;
     private int session; // номер сесії: відповіді зі старої сесії ігноруються
     private boolean renderErrorLogged;
+    private long debtNs; // скільки часу гри мод «перебрав» і ще має віддати
     private static boolean keyHintShown;
 
     // ---- стан фонового потоку ----
@@ -80,6 +87,7 @@ final class LiveMap {
     private long nextTry;
     private long nextBlocks;
     private int failures;
+    private int batchBytes = BATCH_BYTES; // поточна межа пакета: менша після 503
     private long failingSince; // коли почалися помилки поспіль (0 — усе гаразд)
     private boolean authFailed;
     private boolean firstUploadShown;
@@ -171,6 +179,10 @@ final class LiveMap {
             requestFlush(false);
         }
         if (queue.isEmpty()) return;
+        if (debtNs > 0) {
+            debtNs = Math.max(0, debtNs - TICK_BUDGET_NS);
+            return;
+        }
         tops.checkReload();
         String dim = dimension(level);
         long t0 = System.nanoTime();
@@ -202,6 +214,8 @@ final class LiveMap {
             }
             done++;
         }
+        long spent = System.nanoTime() - t0;
+        if (spent > TICK_BUDGET_NS) debtNs = Math.min(MAX_DEBT_NS, spent - TICK_BUDGET_NS);
     }
 
     // ================= черга =================
@@ -284,7 +298,7 @@ final class LiveMap {
             List<BlockSync.Encoded> batch = new ArrayList<>();
             int bytes = 6;
             for (BlockSync.Encoded e : list.values()) {
-                if (batch.size() >= BATCH || (!batch.isEmpty() && bytes + e.gzip().length > BATCH_BYTES)) break;
+                if (batch.size() >= BATCH || (!batch.isEmpty() && bytes + e.gzip().length > batchBytes)) break;
                 batch.add(e);
                 bytes += 28 + e.gzip().length;
             }
@@ -309,6 +323,7 @@ final class LiveMap {
                     return true;
                 }
                 lastError = e.getMessage();
+                shrinkOn503(e, batch.size());
                 backoff();
                 return false;
             } catch (Exception e) {
@@ -374,7 +389,7 @@ final class LiveMap {
             List<Pending> batch = new ArrayList<>();
             int bytes = 0;
             for (Pending p : list.values()) {
-                if (batch.size() >= BATCH || (!batch.isEmpty() && bytes + p.png.length > BATCH_BYTES)) break;
+                if (batch.size() >= BATCH || (!batch.isEmpty() && bytes + p.png.length > batchBytes)) break;
                 batch.add(p);
                 bytes += p.png.length + 1100;
             }
@@ -417,6 +432,7 @@ final class LiveMap {
                     for (Pending p : batch) list.remove(key(p.cx, p.cz));
                     continue;
                 }
+                shrinkOn503(e, batch.size());
                 backoff();
                 return false;
             } catch (Exception e) {
@@ -441,7 +457,13 @@ final class LiveMap {
         }
     }
 
+    /** Голий 503 від Cloudflare найчастіше означає, що пакет завеликий для воркера: наступний робимо вдвічі меншим. */
+    private void shrinkOn503(SiteApi.HttpError e, int count) {
+        if (e.status == 503 && count > 1) batchBytes = Math.max(MIN_BATCH_BYTES, batchBytes / 2);
+    }
+
     private void recovered() {
+        if (batchBytes < BATCH_BYTES) batchBytes = Math.min(BATCH_BYTES, batchBytes * 2);
         failures = 0;
         failingSince = 0;
         if (offlineShown) {

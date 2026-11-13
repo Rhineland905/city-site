@@ -280,7 +280,8 @@ const BLOCKS_SCHEMA = `CREATE TABLE IF NOT EXISTS live_blocks (
     hash TEXT NOT NULL, data BLOB NOT NULL, updated_at INTEGER NOT NULL,
     PRIMARY KEY (layer, cx, cz))`;
 const BLOCKS_MAX_CHUNK = 256 * 1024; // один чанк стиснутим: зазвичай 1–10 КБ
-const BLOCKS_PAGE = 64;              // стільки чанків віддаємо браузеру за раз
+const BLOCKS_PAGE = 32;              // стільки чанків віддаємо браузеру за раз (менше — щоб влізти в процесор воркера)
+const MINIS_PAGE = 512;              // міні чанків за раз
 const MODEL_DEFAULT_HEIGHT = 128;    // старі шари не знають висоти свого схематика
 
 // Таблицы создаются сами при первом запросе, вручную ничего выполнять не нужно.
@@ -362,6 +363,44 @@ const MAP_TASK = `Місто під землею, тому звичайна ма
 Попросити додати в BlueMap окрему мапу з render-mask за висотою міста (min-y / max-y) і вимкненим remove-caves-below-y. Тоді підземне місто з’явиться на BlueMap і оновлюватиметься саме.
 
 Файл картинки має бути не більшим за 25 МБ.`;
+
+// Картинки й блоки чанків — це BLOB у D1. Але D1 у воркері передає BLOB масивом чисел (кожен байт —
+// окреме число в JSON), і на 1 МБ це ~100 мс процесора. Безкоштовний план дає воркеру ~10 мс, тож
+// Cloudflare обривав такі запити з голим «HTTP 503» (помилка 1102). Тому ганяємо байти шістнадцятковим
+// рядком: пишемо через unhex(?), читаємо через hex(…). У базі вони так і лежать BLOB.
+const HEX_DIGITS = (() => {
+  const t = new Uint8Array(512), d = '0123456789abcdef';
+  for (let i = 0; i < 256; i++) { t[i * 2] = d.charCodeAt(i >> 4); t[i * 2 + 1] = d.charCodeAt(i & 15); }
+  return t;
+})();
+function toHexStr(buf) {
+  const b = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  const o = new Uint8Array(b.length * 2);
+  for (let i = 0, j = 0; i < b.length; i++, j += 2) { const v = b[i] * 2; o[j] = HEX_DIGITS[v]; o[j + 1] = HEX_DIGITS[v + 1]; }
+  return new TextDecoder().decode(o);
+}
+const nib = (c) => (c <= 57 ? c - 48 : (c | 32) - 87);
+// Якщо D1 раптом не знає unhex (старий SQLite), пишемо по-старому, масивом.
+let unhexOk = true;
+async function batchBlobs(env, make) {
+  if (unhexOk) {
+    try {
+      return await d1Retry(() => env.DB.batch(make(true)));
+    } catch (e) {
+      if (!/no such function: unhex/i.test(String(e?.message || e))) throw e;
+      unhexOk = false;
+    }
+  }
+  return d1Retry(() => env.DB.batch(make(false)));
+}
+// Із hex(…) приходить рядок; про всяк випадок приймаємо й масив чисел чи ArrayBuffer.
+function blobBytes(v) {
+  if (v == null) return new Uint8Array(0);
+  if (typeof v !== 'string') return new Uint8Array(v);
+  const s = new TextEncoder().encode(v), out = new Uint8Array(s.length >> 1);
+  for (let i = 0, j = 0; i < out.length; i++, j += 2) out[i] = (nib(s[j]) << 4) | nib(s[j + 1]);
+  return out;
+}
 
 let schemaReady = null;
 function ensureSchema(env) {
@@ -1051,17 +1090,22 @@ async function live(request, env, method, parts, waitUntil) {
 
   // Міні всіх чанків одним шматком: i32 cx, i32 cz і 1024 байти RGBA на кожен.
   if (method === 'GET' && action === 'minis') {
-    const { results } = await env.DB.prepare('SELECT cx, cz, mini FROM live_tiles WHERE layer = ? AND updated_at >= ?')
-      .bind(id, since).all();
+    const offset = Math.max(0, int(new URL(request.url).searchParams.get('offset')) || 0);
+    const { results } = await env.DB.prepare(
+      'SELECT cx, cz, hex(mini) AS mini FROM live_tiles WHERE layer = ? AND updated_at >= ? ORDER BY updated_at, cx, cz LIMIT ? OFFSET ?'
+    ).bind(id, since, MINIS_PAGE + 1, offset).all();
+    const page = results.slice(0, MINIS_PAGE);
     const size = 8 + MINI_BYTES;
-    const out = new Uint8Array(results.length * size);
+    const out = new Uint8Array(page.length * size);
     const dv = new DataView(out.buffer);
-    results.forEach((r, i) => {
+    page.forEach((r, i) => {
       dv.setInt32(i * size, r.cx);
       dv.setInt32(i * size + 4, r.cz);
-      out.set(new Uint8Array(r.mini).subarray(0, MINI_BYTES), i * size + 8);
+      out.set(blobBytes(r.mini).subarray(0, MINI_BYTES), i * size + 8);
     });
-    return new Response(out, { headers: { 'content-type': 'application/octet-stream', 'cache-control': 'no-store' } });
+    return new Response(out, { headers: {
+      'content-type': 'application/octet-stream', 'cache-control': 'no-store', 'x-more': results.length > MINIS_PAGE ? '1' : '0',
+    } });
   }
 
   if (method === 'GET' && action === 'tile') {
@@ -1071,11 +1115,11 @@ async function live(request, env, method, parts, waitUntil) {
     const cache = want && typeof caches !== 'undefined' ? caches.default : null;
     const hit = cache && (await cache.match(request).catch(() => null));
     if (hit) return hit;
-    const row = await env.DB.prepare('SELECT png, hash FROM live_tiles WHERE layer = ? AND cx = ? AND cz = ?')
+    const row = await env.DB.prepare('SELECT hex(png) AS png, hash FROM live_tiles WHERE layer = ? AND cx = ? AND cz = ?')
       .bind(id, cx, cz).first();
     if (!row) return fail(404, 'Чанк не знайдено');
     const fresh = want === row.hash; // в адресі хеш, тож таку картинку можна кешувати назавжди
-    const res = new Response(new Uint8Array(row.png), {
+    const res = new Response(blobBytes(row.png), {
       headers: {
         'content-type': 'image/png',
         'cache-control': fresh ? 'public, max-age=31536000, immutable' : 'public, max-age=60',
@@ -1090,9 +1134,9 @@ async function live(request, env, method, parts, waitUntil) {
   if (method === 'GET' && action === 'blocks') {
     const offset = Math.max(0, int(new URL(request.url).searchParams.get('offset')) || 0);
     const { results } = await env.DB.prepare(
-      'SELECT cx, cz, data, updated_at FROM live_blocks WHERE layer = ? AND updated_at >= ? ORDER BY updated_at, cx, cz LIMIT ? OFFSET ?'
+      'SELECT cx, cz, hex(data) AS data, updated_at FROM live_blocks WHERE layer = ? AND updated_at >= ? ORDER BY updated_at, cx, cz LIMIT ? OFFSET ?'
     ).bind(id, since, BLOCKS_PAGE + 1, offset).all();
-    const page = results.slice(0, BLOCKS_PAGE).map((r) => ({ ...r, data: new Uint8Array(r.data) }));
+    const page = results.slice(0, BLOCKS_PAGE).map((r) => ({ ...r, data: blobBytes(r.data) }));
     const out = new Uint8Array(page.reduce((n, r) => n + 20 + r.data.length, 0));
     const dv = new DataView(out.buffer);
     let o = 0;
@@ -1134,11 +1178,11 @@ async function live(request, env, method, parts, waitUntil) {
     const now = Date.now();
     let saved = 0;
     if (ok.length) {
-      const res = await d1Retry(() => env.DB.batch(ok.map((t) => env.DB.prepare(
-        `INSERT INTO live_blocks (layer, cx, cz, hash, data, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+      const res = await batchBlobs(env, (hex) => ok.map((t) => env.DB.prepare(
+        `INSERT INTO live_blocks (layer, cx, cz, hash, data, updated_at) VALUES (?, ?, ?, ?, ${hex ? 'unhex(?)' : '?'}, ?)
          ON CONFLICT(layer, cx, cz) DO UPDATE SET hash = excluded.hash, data = excluded.data, updated_at = excluded.updated_at
          WHERE live_blocks.hash <> excluded.hash`
-      ).bind(id, t.cx, t.cz, t.hash, t.data, now))));
+      ).bind(id, t.cx, t.cz, t.hash, hex ? toHexStr(t.data) : t.data, now)));
       saved = res.reduce((n, r) => n + (r.meta?.changes || 0), 0);
     }
     return json({ saved, unchanged: ok.length - saved, outside: count - ok.length });
@@ -1159,12 +1203,12 @@ async function live(request, env, method, parts, waitUntil) {
     const now = Date.now();
     let saved = 0;
     if (ok.length) {
-      const res = await d1Retry(() => env.DB.batch(ok.map((t) => env.DB.prepare(
-        `INSERT INTO live_tiles (layer, cx, cz, hash, png, mini, player, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      const res = await batchBlobs(env, (hex) => ok.map((t) => env.DB.prepare(
+        `INSERT INTO live_tiles (layer, cx, cz, hash, png, mini, player, updated_at) VALUES (?, ?, ?, ?, ${hex ? 'unhex(?), unhex(?)' : '?, ?'}, ?, ?)
          ON CONFLICT(layer, cx, cz) DO UPDATE SET hash = excluded.hash, png = excluded.png, mini = excluded.mini,
            player = excluded.player, updated_at = excluded.updated_at
          WHERE live_tiles.hash <> excluded.hash`
-      ).bind(id, t.cx, t.cz, t.hash, t.png, t.mini, player, now))));
+      ).bind(id, t.cx, t.cz, t.hash, hex ? toHexStr(t.png) : t.png, hex ? toHexStr(t.mini) : t.mini, player, now)));
       saved = res.reduce((n, r) => n + (r.meta?.changes || 0), 0);
     }
     return json({ saved, unchanged: ok.length - saved, outside: tiles.length - ok.length });

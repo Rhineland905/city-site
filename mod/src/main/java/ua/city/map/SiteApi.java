@@ -21,7 +21,7 @@ import java.util.Map;
 final class SiteApi {
     private SiteApi() {}
 
-    static final String USER_AGENT = "CityMap/1.1.1 (Minecraft mod)";
+    static final String USER_AGENT = "CityMap/1.1.2 (Minecraft mod)";
 
     /** Область, яку редактор додав на сайті: межі в блоках (рівно по чанках, включно) і свій зріз. */
     record Area(int minX, int minZ, int maxX, int maxZ, int top, int bottom) {
