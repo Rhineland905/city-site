@@ -21,7 +21,7 @@ import java.util.Map;
 final class SiteApi {
     private SiteApi() {}
 
-    static final String USER_AGENT = "CityMap/1.1 (Minecraft mod)";
+    static final String USER_AGENT = "CityMap/1.1.1 (Minecraft mod)";
 
     /** Область, яку редактор додав на сайті: межі в блоках (рівно по чанках, включно) і свій зріз. */
     record Area(int minX, int minZ, int maxX, int maxZ, int top, int bottom) {
@@ -158,7 +158,38 @@ final class SiteApi {
         }
     }
 
+    // Скільки разів повторити запит, якщо зв'язок обірвався або Cloudflare на мить не відповів, і пауза перед кожним.
+    private static final long[] RETRY_MS = {1_500, 5_000};
+
+    /**
+     * Запит із повтором. Інтернет гравця і Cloudflare час від часу губляться на кілька секунд
+     * (обірване з'єднання, тайм-аут, 502/503/429, «база зайнята»), тож одну таку помилку
+     * не рахуємо: пробуємо ще раз. Надсилання повторювати безпечно: сайт порівнює хеші.
+     */
     private static byte[] request(String method, String url, Map<String, String> headers, byte[] body) throws IOException {
+        for (int attempt = 0; ; attempt++) {
+            try {
+                return requestOnce(method, url, headers, body);
+            } catch (IOException e) {
+                if (attempt >= RETRY_MS.length || !transient_(e)) throw e;
+                try {
+                    Thread.sleep(RETRY_MS[attempt]);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+    }
+
+    /** Чи варто повторити: збій зв'язку або тимчасова відповідь сервера, а не «ключ не той» чи «шар вимкнено». */
+    private static boolean transient_(IOException e) {
+        if (e instanceof HttpError h) return h.status == 429 || h.status == 500 || h.status >= 502;
+        String m = e.getMessage();
+        return m == null || !m.startsWith("Неправильна адреса сайту");
+    }
+
+    private static byte[] requestOnce(String method, String url, Map<String, String> headers, byte[] body) throws IOException {
         HttpURLConnection c;
         try {
             c = (HttpURLConnection) URI.create(url).toURL().openConnection();

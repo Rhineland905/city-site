@@ -42,6 +42,7 @@ final class LiveMap {
     private static final int BATCH = 24;                   // стільки чанків приймає сайт за раз
     private static final int BATCH_BYTES = 5 * 1024 * 1024;
     private static final int MAX_PENDING = 400;
+    private static final long OFFLINE_NOTICE_MS = 120_000; // казати гравцю, лише якщо сайт мовчить довше за 2 хвилини
     private static final byte[] EMPTY_BODY = {'C', 'M', 'T', '1', 0, 0};
 
     private final Config cfg;
@@ -79,6 +80,7 @@ final class LiveMap {
     private long nextTry;
     private long nextBlocks;
     private int failures;
+    private long failingSince; // коли почалися помилки поспіль (0 — усе гаразд)
     private boolean authFailed;
     private boolean firstUploadShown;
     private boolean offlineShown;
@@ -298,7 +300,7 @@ final class LiveMap {
                 }
                 sentBlocks.addAndGet(r.has("saved") ? r.get("saved").getAsInt() : batch.size());
                 nextBlocks = System.currentTimeMillis() + 5_000;
-                failures = 0;
+                recovered();
             } catch (SiteApi.HttpError e) {
                 if (e.status == 401 || e.status == 404 || e.status == 409 || e.status == 400 || e.status == 413) {
                     // Ключ, шар чи пакет не підходять: про ключ скаже відправка картинок, а блоки просто не шлемо.
@@ -389,9 +391,8 @@ final class LiveMap {
                 int saved = r.has("saved") ? r.get("saved").getAsInt() : batch.size();
                 sent.addAndGet(saved);
                 unchanged.addAndGet(batch.size() - saved);
-                failures = 0;
                 lastError = "";
-                offlineShown = false;
+                recovered();
                 if (saved > 0 && !firstUploadShown) {
                     firstUploadShown = true;
                     say(Component.literal("Мапа на сайті оновлюється: надіслано " + chunks(saved) + ". ")
@@ -428,11 +429,24 @@ final class LiveMap {
     }
 
     private void backoff() {
+        long now = System.currentTimeMillis();
         failures++;
-        nextTry = System.currentTimeMillis() + Math.min(300_000L, 5_000L << Math.min(6, failures - 1));
-        if (failures >= 3 && !offlineShown) {
+        if (failingSince == 0) failingSince = now;
+        nextTry = now + Math.min(300_000L, 5_000L << Math.min(6, failures - 1));
+        // Короткі збої (кілька секунд) мод переживає сам, тож гравцю кажемо лише про довгі, і з причиною.
+        if (failures >= 3 && now - failingSince >= OFFLINE_NOTICE_MS && !offlineShown) {
             offlineShown = true;
-            say(Component.literal("Не вдається достукатися до сайту, спробую пізніше.").withStyle(ChatFormatting.GRAY));
+            say(Component.literal("Не вдається достукатися до сайту (" + lastError + "), спробую пізніше. Нічого не загубиться.")
+                .withStyle(ChatFormatting.GRAY));
+        }
+    }
+
+    private void recovered() {
+        failures = 0;
+        failingSince = 0;
+        if (offlineShown) {
+            offlineShown = false;
+            say(Component.literal("Зв'язок із сайтом відновився, мапа знову оновлюється.").withStyle(ChatFormatting.GRAY));
         }
     }
 
@@ -532,6 +546,8 @@ final class LiveMap {
         worker.execute(() -> {
             authFailed = false;
             failures = 0;
+            failingSince = 0;
+            offlineShown = false;
             nextTry = 0;
             firstUploadShown = false;
         });
