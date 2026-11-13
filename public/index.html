@@ -25,6 +25,7 @@
       <button class="tab" data-view="schematics" role="tab">Схематики</button>
       <button class="tab" data-view="tasks" role="tab">Завдання</button>
       <button class="tab" data-view="lore" role="tab">Лор</button>
+      <button class="tab editor-only" data-view="stats" role="tab">Відвідуваність</button>
     </nav>
     <button class="btn ghost" id="loginBtn">Увійти</button>
   </header>
@@ -145,6 +146,21 @@
           <div class="lore-head"><h2>Історія</h2></div>
           <ol class="lore-list" id="loreList"></ol>
         </section>
+      </div>
+    </section>
+    <!-- Відвідуваність (лише редактори) -->
+    <section class="view" id="view-stats">
+      <div class="page">
+        <div class="page-head">
+          <h1>Відвідуваність</h1>
+          <div class="seg" id="statsDays" role="group" aria-label="Період">
+            <button type="button" data-days="7">7 днів</button>
+            <button type="button" data-days="30" class="on">30 днів</button>
+            <button type="button" data-days="90">90 днів</button>
+          </div>
+          <button class="btn" id="statsRefresh">Оновити</button>
+        </div>
+        <div id="statsBody"><p class="empty">Завантаження…</p></div>
       </div>
     </section>
   </main>

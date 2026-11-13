@@ -799,3 +799,51 @@ dialog.img-viewer::backdrop { background: #000; animation: none; }
   .lore-head h2 { flex: 1 0 100%; }
   .lore-head input[type=search] { max-width: none; }
 }
+
+/* Відвідуваність */
+.stat-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 30px; }
+.stat-tile {
+  display: flex; flex-direction: column; gap: 4px; padding: 14px 16px;
+  background: var(--panel); border: 2px solid var(--line); border-radius: var(--radius);
+}
+.stat-label { color: var(--muted); font-size: 13px; }
+.stat-value {
+  font-family: var(--pixel); font-size: 34px; font-weight: 600; line-height: 1.1; color: var(--soul);
+  text-shadow: 0 0 14px rgba(34, 225, 227, .45); font-variant-numeric: tabular-nums;
+}
+.stat-note { font-size: 12px; margin: 0; }
+.stats-block { margin-bottom: 30px; }
+.stats-card { background: var(--panel); border: 2px solid var(--line); border-radius: var(--radius); padding: 12px; }
+.stats-chart { display: block; width: 100%; height: auto; }
+.stats-chart .grid { stroke: var(--line); stroke-width: 1; }
+.stats-chart .axis { fill: var(--muted); font-size: 11px; font-family: "JetBrains Mono", monospace; }
+.stats-chart .bar { fill: var(--soul); opacity: .8; }
+.stats-chart .tick { fill: var(--done); }
+.stats-chart .hit { fill: transparent; }
+.stats-chart g:hover .bar { opacity: 1; filter: drop-shadow(0 0 6px rgba(34, 225, 227, .7)); }
+.stats-chart g:hover .hit { fill: rgba(34, 225, 227, .06); }
+.legend { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+.legend i { display: inline-block; width: 12px; height: 12px; margin-left: 8px; }
+.lg-bar { background: var(--soul); opacity: .8; }
+.lg-tick { height: 3px !important; background: var(--done); }
+.stats-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 0 24px; }
+.stats-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.stats-list li {
+  display: flex; align-items: center; gap: 12px; padding: 8px 12px;
+  background: var(--panel); border: 2px solid var(--line); border-radius: var(--radius);
+}
+.sl-name { flex: 0 0 auto; min-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stats-list li:not(:has(.sl-bar)) .sl-name { flex: 1; }
+.sl-bar { flex: 1; height: 8px; background: var(--void); border-radius: 2px; overflow: hidden; }
+.sl-bar i { display: block; height: 100%; background: var(--soul); box-shadow: var(--soul-glow); }
+.sl-num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.table-wrap { overflow-x: auto; padding: 0; }
+.stats-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.stats-table th, .stats-table td { padding: 9px 12px; text-align: right; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.stats-table th:first-child, .stats-table td:first-child { text-align: left; }
+.stats-table th { color: var(--muted); font-weight: 500; font-size: 13px; }
+.stats-table tr:last-child td { border-bottom: 0; }
+@media (max-width: 760px) {
+  .stats-cols { grid-template-columns: 1fr; }
+  .stat-value { font-size: 28px; }
+}

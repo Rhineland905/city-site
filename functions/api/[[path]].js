@@ -284,6 +284,15 @@ const BLOCKS_PAGE = 32;              // стільки чанків віддає
 const MINIS_PAGE = 512;              // міні чанків за раз
 const MODEL_DEFAULT_HEIGHT = 128;    // старі шари не знають висоти свого схематика
 
+// Відвідуваність: кожне відкриття сторінки й розділу — один рядок. vid — випадковий id браузера
+// (localStorage), за ним рахуємо унікальних відвідувачів. Ні IP, ні cookie для цього не зберігаємо.
+const VISITS_SCHEMA = `CREATE TABLE IF NOT EXISTS visits (
+    ts INTEGER NOT NULL, vid TEXT NOT NULL, user TEXT, section TEXT NOT NULL,
+    entry INTEGER NOT NULL DEFAULT 0, ref TEXT)`;
+const VISIT_SECTIONS = ['map', 'map3d', 'schematics', 'tasks', 'lore'];
+const VISITS_KEEP_DAYS = 400;
+const BOT_UA = /bot|crawl|spider|slurp|preview|headless|lighthouse|facebookexternalhit|embedly|curl|wget|python/i;
+
 // Таблицы создаются сами при первом запросе, вручную ничего выполнять не нужно.
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS schematics (
@@ -330,6 +339,8 @@ const SCHEMA = [
     user_id INTEGER UNIQUE, home_marker INTEGER, skin TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  VISITS_SCHEMA,
+  'CREATE INDEX IF NOT EXISTS visits_ts ON visits (ts)',
 ];
 // Типи міток. Підписи й значки задає сайт (app.js), тут лише список дозволених.
 const MARKER_KINDS = ['home', 'farm', 'storage', 'mine', 'portal', 'shop', 'danger', 'other'];
@@ -496,6 +507,8 @@ export async function onRequest({ request, env, params, waitUntil }) {
     if (section === 'pack') return await pack(request, env, method, id);
     if (section === 'lore') return await lore(request, env, method, id, action);
     if (section === 'members') return await members(request, env, method, id, action);
+    if (section === 'visit' && method === 'POST') return await visit(request, env, waitUntil);
+    if (section === 'stats' && method === 'GET') return await stats(request, env);
     if (section === 'skin' && method === 'GET') { // прев’ю скіна за ніком у вікні профілю
       const png = await mojangSkin(env, id);
       return png ? imageResponse(png, 'image/png', `public, max-age=${SKIN_CACHE_S}`) : fail(404, 'Скіна немає');
@@ -1574,4 +1587,80 @@ async function mojangSkin(env, nick) {
   }
   await env.FILES.put(key, png || new ArrayBuffer(0), { expirationTtl: png ? SKIN_CACHE_S : 3600 });
   return png;
+}
+
+// ---------- Відвідуваність ----------
+// Сторінка шле сюди відкриття сайту (entry) і кожного розділу. Запис не гальмує відповідь.
+async function visit(request, env, waitUntil) {
+  const body = await request.json().catch(() => ({}));
+  const vid = String(body.vid || '');
+  const section = VISIT_SECTIONS.includes(body.section) ? body.section : null;
+  if (!/^[0-9a-f]{32}$/.test(vid) || !section || BOT_UA.test(request.headers.get('user-agent') || '')) {
+    return json({ ok: false });
+  }
+  let ref = null;
+  if (body.entry && body.ref) {
+    try {
+      const host = new URL(String(body.ref)).hostname.replace(/^www\./, '');
+      if (host && host !== new URL(request.url).hostname) ref = host.slice(0, 80);
+    } catch {}
+  }
+  const now = Date.now();
+  const stmts = [
+    env.DB.prepare('INSERT INTO visits (ts, vid, user, section, entry, ref) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(now, vid, who(request).user?.username || null, section, body.entry ? 1 : 0, ref),
+  ];
+  // Зрідка прибираємо зовсім старі записи, щоб база не росла без кінця.
+  if (Math.random() < 0.01) {
+    stmts.push(env.DB.prepare('DELETE FROM visits WHERE ts < ?').bind(now - VISITS_KEEP_DAYS * 86400_000));
+  }
+  const write = d1Retry(() => env.DB.batch(stmts)).catch((e) => console.error('visit', String(e)));
+  if (waitUntil) waitUntil(write); else await write;
+  return json({ ok: true });
+}
+
+// Статистика для редакторів. days — за скільки днів, tz — зсув часового поясу браузера в хвилинах
+// (як Date.getTimezoneOffset з мінусом), щоб «сьогодні» й дні збігалися з годинником редактора.
+async function stats(request, env) {
+  if (!authorized(request)) return fail(403, 'Відвідуваність бачать лише редактори');
+  const q = new URL(request.url).searchParams;
+  const days = Math.min(Math.max(parseInt(q.get('days'), 10) || 30, 1), 365);
+  const tz = Math.min(Math.max(parseInt(q.get('tz'), 10) || 0, -840), 840);
+  const shift = tz * 60_000;
+  const now = Date.now();
+  // Початок сьогоднішнього дня за часом редактора, далі — days днів назад.
+  const todayStart = Math.floor((now + shift) / 86400_000) * 86400_000 - shift;
+  const from = todayStart - (days - 1) * 86400_000;
+  const day = `date((ts + ${shift}) / 1000, 'unixepoch')`;
+  const all = (sql, ...args) => env.DB.prepare(sql).bind(...args).all().then((r) => r.results);
+  const one = (sql, ...args) => env.DB.prepare(sql).bind(...args).first();
+  const SUMMARY = `SELECT COUNT(DISTINCT vid) AS visitors, SUM(entry) AS visits, COUNT(*) AS views,
+    COUNT(DISTINCT user) AS users FROM visits WHERE ts >= ?`;
+  const [today, period, active, daily, sections, users, refs, total] = await d1Retry(() => Promise.all([
+    one(SUMMARY, todayStart),
+    one(SUMMARY, from),
+    one('SELECT COUNT(DISTINCT vid) AS n FROM visits WHERE ts >= ?', now - 15 * 60_000),
+    all(`SELECT ${day} AS day, COUNT(DISTINCT vid) AS visitors, SUM(entry) AS visits, COUNT(*) AS views
+      FROM visits WHERE ts >= ? GROUP BY day ORDER BY day`, from),
+    all(`SELECT section, COUNT(*) AS views, COUNT(DISTINCT vid) AS visitors
+      FROM visits WHERE ts >= ? GROUP BY section ORDER BY views DESC`, from),
+    all(`SELECT user, SUM(entry) AS visits, COUNT(*) AS views, COUNT(DISTINCT ${day}) AS days, MAX(ts) AS last
+      FROM visits WHERE ts >= ? AND user IS NOT NULL GROUP BY user ORDER BY last DESC LIMIT 100`, from),
+    all(`SELECT ref, COUNT(*) AS visits FROM visits WHERE ts >= ? AND entry = 1 AND ref IS NOT NULL
+      GROUP BY ref ORDER BY visits DESC LIMIT 10`, from),
+    one('SELECT COUNT(DISTINCT vid) AS visitors, MIN(ts) AS since FROM visits'),
+  ]));
+  // Дні без жодного відвідування теж показуємо, нулями.
+  const byDay = new Map(daily.map((d) => [d.day, d]));
+  const series = [];
+  for (let i = 0; i < days; i++) {
+    const d = new Date(from + shift + i * 86400_000).toISOString().slice(0, 10);
+    series.push(byDay.get(d) || { day: d, visitors: 0, visits: 0, views: 0 });
+  }
+  const num = (r) => ({ visitors: r?.visitors || 0, visits: r?.visits || 0, views: r?.views || 0, users: r?.users || 0 });
+  return json({
+    days, today: num(today), period: num(period), active: active?.n || 0,
+    daily: series, sections, users, refs,
+    total: { visitors: total?.visitors || 0, since: total?.since || null },
+  });
 }
