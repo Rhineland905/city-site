@@ -63,7 +63,10 @@ function setSession(me) {
   document.body.classList.toggle('admin', !!state.me?.admin);
   $('#loginBtn').textContent = on ? state.me.user.username : 'Увійти';
   $('#loginBtn').title = on ? 'Акаунт' : '';
-  if (!state.me?.editor) { setPlacing(false); stopAreaDraw(); }
+  if (!state.me?.editor) {
+    setPlacing(false); stopAreaDraw();
+    if ($('#view-stats').classList.contains('active')) showView('map');
+  }
   renderPins(); // редактор може перетягувати мітки
   renderMarkersList();
   renderAreas();
@@ -215,10 +218,13 @@ async function withBusy(form, fn) {
 
 // ---------- Вкладки ----------
 function showView(name) {
+  if (name === 'stats' && !isEditor()) name = 'map';
   $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.view === name));
   $$('.view').forEach((v) => v.classList.toggle('active', v.id === 'view-' + name));
   if (name === 'map') setTimeout(() => map.invalidateSize(), 0);
   if (name !== 'lore' && !$('#loreDrawer').hidden) closeLoreDrawer();
+  if (name === 'stats') loadStats();
+  else trackVisit(name === 'map' && v3d.mode === '3d' ? 'map3d' : name);
 }
 $$('.tab').forEach((t) => t.addEventListener('click', () => showView(t.dataset.view)));
 
@@ -1498,6 +1504,7 @@ function setMode(mode) {
   store.set('mapMode', mode);
   if (mode === '3d') show3d();
   syncLive();
+  if ($('#view-map').classList.contains('active')) trackVisit(mode === '3d' ? 'map3d' : 'map');
 }
 $$('#modeSeg button').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
 
@@ -2923,4 +2930,145 @@ addEventListener('hashchange', openLoreHash);
   } catch (err) {
     toast('Не вдалося завантажити дані: ' + err.message);
   }
+  if (!visits.entrySent) trackVisit(v3d.mode === '3d' ? 'map3d' : 'map');
 })();
+
+// ---------- Відвідуваність ----------
+// Кожен браузер має випадковий id у localStorage: за ним сервер рахує унікальних відвідувачів.
+// Перше повідомлення за завантаження сторінки — це візит, далі — відкриті розділи
+// (той самий розділ рахуємо не частіше ніж раз на 5 хвилин).
+const visits = { entrySent: false, last: {} };
+function visitorId() {
+  let id = store.get('visitorId');
+  if (!/^[0-9a-f]{32}$/.test(id || '')) {
+    id = [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, '0')).join('');
+    store.set('visitorId', id);
+  }
+  return id;
+}
+function trackVisit(section) {
+  const now = Date.now();
+  if (visits.entrySent && now - (visits.last[section] || 0) < 5 * 60_000) return;
+  visits.last[section] = now;
+  const body = { vid: visitorId(), section };
+  if (!visits.entrySent) { body.entry = 1; body.ref = document.referrer || ''; visits.entrySent = true; }
+  fetch('/api/visit', {
+    method: 'POST', keepalive: true, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  }).catch(() => {});
+}
+
+const SECTION_NAMES = { map: 'Мапа', map3d: 'Мапа 3D', schematics: 'Схематики', tasks: 'Завдання', lore: 'Лор' };
+let statsDays = Number(store.get('statsDays')) || 30;
+let statsBusy = 0;
+async function loadStats() {
+  const body = $('#statsBody');
+  $$('#statsDays button').forEach((b) => b.classList.toggle('on', Number(b.dataset.days) === statsDays));
+  const ticket = ++statsBusy;
+  if (!body.dataset.loaded) body.innerHTML = '<p class="empty">Завантаження…</p>';
+  try {
+    const s = await api(`stats?days=${statsDays}&tz=${-new Date().getTimezoneOffset()}`);
+    if (ticket !== statsBusy) return;
+    body.dataset.loaded = '1';
+    renderStats(s);
+  } catch (err) {
+    if (ticket === statsBusy) body.innerHTML = `<p class="empty">Не вдалося завантажити: ${esc(err.message)}</p>`;
+  }
+}
+$('#statsDays').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-days]');
+  if (!b) return;
+  statsDays = Number(b.dataset.days);
+  store.set('statsDays', String(statsDays));
+  loadStats();
+});
+$('#statsRefresh').addEventListener('click', loadStats);
+
+const fmtNum = (n) => Number(n || 0).toLocaleString('uk-UA');
+const fmtDay = (d, opts) => new Date(d + 'T12:00:00').toLocaleDateString('uk-UA', opts);
+function fmtAgo(ts) {
+  const min = Math.round((Date.now() - ts) / 60_000);
+  if (min < 2) return 'щойно';
+  if (min < 60) return `${min} хв тому`;
+  const h = Math.round(min / 60);
+  if (h < 24) return `${h} год тому`;
+  return new Date(ts).toLocaleDateString('uk-UA', { day: 'numeric', month: 'short' });
+}
+function statsChart(daily) {
+  // Малюємо в справжню ширину блоку, щоб підписи на телефоні не ставали дрібними.
+  const W = Math.max(300, Math.round($('#statsBody').clientWidth - 28)), H = W < 500 ? 200 : 240, top = 14, bottom = 26, left = 34, right = 8;
+  const max = Math.max(1, ...daily.map((d) => Math.max(d.visitors, d.visits)));
+  // Красива верхня межа шкали: 1, 2, 5, 10, 20, 50…
+  const step = [1, 2, 5].map((m) => m * 10 ** Math.floor(Math.log10(max))).find((v) => v * 4 >= max) || 10 ** Math.ceil(Math.log10(max));
+  const ceil = Math.ceil(max / step) * step;
+  const ih = H - top - bottom, iw = W - left - right;
+  const bw = iw / daily.length;
+  const y = (v) => top + ih - (v / ceil) * ih;
+  const grid = [];
+  for (let v = 0; v <= ceil; v += step) {
+    grid.push(`<line x1="${left}" x2="${W - right}" y1="${y(v)}" y2="${y(v)}" class="grid"/><text x="${left - 6}" y="${y(v) + 4}" class="axis" text-anchor="end">${v}</text>`);
+  }
+  const every = Math.ceil(daily.length / Math.max(3, Math.floor(iw / 70)));
+  const bars = daily.map((d, i) => {
+    const x = left + i * bw, w = Math.max(1, bw - Math.min(4, bw * 0.25));
+    const tip = `${fmtDay(d.day, { weekday: 'short', day: 'numeric', month: 'short' })}: відвідувачів ${d.visitors}, візитів ${d.visits}, переглядів ${d.views}`;
+    const label = (daily.length - 1 - i) % every === 0
+      ? `<text x="${x + bw / 2}" y="${H - 8}" class="axis" text-anchor="middle">${fmtDay(d.day, { day: 'numeric', month: daily.length > 10 ? 'numeric' : 'short' })}</text>` : '';
+    return `<g><title>${esc(tip)}</title><rect x="${x}" y="${top}" width="${bw}" height="${ih}" class="hit"/>`
+      + `<rect x="${x + (bw - w) / 2}" y="${y(d.visitors)}" width="${w}" height="${top + ih - y(d.visitors)}" class="bar"/>`
+      + (d.visits ? `<rect x="${x + (bw - w) / 2}" y="${y(d.visits) - 1}" width="${w}" height="2" class="tick"/>` : '')
+      + `</g>${label}`;
+  }).join('');
+  return `<svg class="stats-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Відвідувачі по днях">${grid.join('')}${bars}</svg>`;
+}
+let statsLast = null;
+addEventListener('resize', () => {
+  clearTimeout(statsLast?.timer);
+  if (statsLast && $('#view-stats').classList.contains('active')) statsLast.timer = setTimeout(() => renderStats(statsLast), 200);
+});
+function renderStats(s) {
+  statsLast = s;
+  const p = s.period, t = s.today;
+  const tile = (label, value, note = '') =>
+    `<div class="stat-tile"><span class="stat-label">${label}</span><b class="stat-value">${fmtNum(value)}</b>${note ? `<span class="muted stat-note">${note}</span>` : ''}</div>`;
+  const sectionMax = Math.max(1, ...s.sections.map((x) => x.views));
+  const noData = !s.total.since;
+  $('#statsBody').innerHTML = `
+    <div class="stat-tiles">
+      ${tile('Зараз на сайті', s.active, 'за останні 15 хв')}
+      ${tile('Сьогодні', t.visitors, `відвідувачів · візитів ${fmtNum(t.visits)}`)}
+      ${tile(`За ${s.days} дн.`, p.visitors, `відвідувачів · візитів ${fmtNum(p.visits)}`)}
+      ${tile('Переглядів розділів', p.views, `за ${s.days} дн.`)}
+      ${tile('Жителів заходило', p.users, `з логіном, за ${s.days} дн.`)}
+    </div>
+    ${noData ? '<p class="empty">Ще нікого не пораховано. Лічильник працює з цієї хвилини.</p>' : `
+    <section class="stats-block">
+      <div class="lore-head"><h2>По днях</h2>
+        <span class="legend"><i class="lg-bar"></i>відвідувачі <i class="lg-tick"></i>візити</span></div>
+      <div class="stats-card">${statsChart(s.daily)}</div>
+    </section>
+    <div class="stats-cols">
+      <section class="stats-block">
+        <div class="lore-head"><h2>Розділи</h2></div>
+        <ul class="stats-list">${s.sections.map((x) => `
+          <li><span class="sl-name">${esc(SECTION_NAMES[x.section] || x.section)}</span>
+            <span class="sl-bar"><i style="width:${(x.views / sectionMax) * 100}%"></i></span>
+            <span class="sl-num">${fmtNum(x.views)} <span class="muted">· ${fmtNum(x.visitors)} осіб</span></span></li>`).join('')
+          || '<li class="muted">Немає даних</li>'}</ul>
+      </section>
+      <section class="stats-block">
+        <div class="lore-head"><h2>Звідки приходять</h2></div>
+        <ul class="stats-list">${s.refs.map((x) => `
+          <li><span class="sl-name">${esc(x.ref)}</span><span class="sl-num">${fmtNum(x.visits)}</span></li>`).join('')
+          || '<li class="muted">Переважно напряму: з закладки або посилання в грі чи месенджері</li>'}</ul>
+      </section>
+    </div>
+    <section class="stats-block">
+      <div class="lore-head"><h2>Жителі з логіном <span class="count">${s.users.length}</span></h2></div>
+      ${s.users.length ? `<div class="stats-card table-wrap"><table class="stats-table">
+        <thead><tr><th>Житель</th><th>Днів</th><th>Візитів</th><th>Переглядів</th><th>Останній раз</th></tr></thead>
+        <tbody>${s.users.map((u) => `<tr><td><b>${esc(u.user)}</b></td><td>${u.days}</td><td>${fmtNum(u.visits)}</td><td>${fmtNum(u.views)}</td><td>${fmtAgo(u.last)}</td></tr>`).join('')}</tbody>
+      </table></div>` : '<p class="muted">За цей період ніхто не заходив під своїм логіном.</p>'}
+    </section>
+    <p class="muted stat-note">Рахуємо з ${new Date(s.total.since).toLocaleDateString('uk-UA')}. Відвідувач — один браузер, візит — одне відкриття сайту.
+      Гості без логіну анонімні: ми не зберігаємо ні IP, ні імен.</p>`}`;
+}
